@@ -1,4 +1,4 @@
-# Unity Catalog Passthrough Library
+# Unity Catalog Credential Passthrough Library
 
 A secure credential passthrough solution for Databricks Unity Catalog clusters that enables direct access to unstructured data while maintaining proper governance for structured data.
 
