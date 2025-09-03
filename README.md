@@ -145,6 +145,33 @@ os.environ['PASSTHROUGH_USE_INTERACTIVE_FLOW'] = 'False'
 
 Requires the Service Principal to have admin consent and appropriate ADLS permissions.
 
+### Azure Service Principal Setup
+
+The Service Principal used for authentication requires specific Azure permissions:
+
+#### Required Azure AD API Permissions
+1. **Azure Storage API**: `https://storage.azure.com/user_impersonation`
+   - **Permission Type**: Delegated
+   - **Admin Consent**: Required
+   - **Purpose**: Allows the application to access Azure Storage on behalf of the signed-in user
+
+To configure in Azure Portal:
+```
+1. Navigate to Azure AD > App registrations > [Your Service Principal]
+2. Go to "API permissions" 
+3. Click "Add a permission"
+4. Select "Azure Storage"
+5. Choose "Delegated permissions"
+6. Select "user_impersonation"
+7. Click "Add permissions"
+8. Click "Grant admin consent for [Your Organization]" (requires Global Admin)
+```
+
+#### Required ADLS Permissions
+The Service Principal also needs appropriate RBAC roles on the ADLS storage account:
+- **Storage Blob Data Contributor** (or higher) on the storage account
+- Permissions should be granted at the appropriate scope (subscription, resource group, or storage account level)
+
 ## Path Routing Configuration
 
 ### Force Patterns
