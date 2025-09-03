@@ -17,11 +17,14 @@ os.environ['PASSTHROUGH_FORCE_ADLS_PATTERNS'] = '/unified/'
 os.environ['PASSTHROUGH_FORCE_UC_PATTERNS'] = '/unknow/'
 os.environ['PASSTHROUGH_CUSTOM_UC_FORMATS'] = 'iceberg, delta, parquet'
 
+
+
+
 # COMMAND ----------
 
 
-from uc_passthrough_library import UCPassthroughDataFrameReader
-spark_passthrough = UCPassthroughDataFrameReader(spark)
+from uc_passthrough_library import create_uc_passthrough_interface
+spark_passthrough = create_uc_passthrough_interface(spark)
 
 # COMMAND ----------
 

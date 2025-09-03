@@ -54,6 +54,9 @@ class PathAnalyzer:
         r'^system\.',
         r'^information_schema\.'
     ]
+    # Add to existing patterns
+    __UC_TABLE_REFERENCE_PATTERN = r'^[a-zA-Z][a-zA-Z0-9_]*\.[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)?$'
+    
     
     # Structured data formats that typically use UC governance - protected
     __UC_MANAGED_FORMATS = {
@@ -76,6 +79,9 @@ class PathAnalyzer:
         self.__lock = threading.Lock()  # Thread safety for configuration access
         
         with self.__lock:
+
+            self.__uc_table_reference_regex = re.compile(self.__UC_TABLE_REFERENCE_PATTERN)
+        
             self.__config = self.__load_secure_config(config)
             
             # Override patterns for explicit organizational control - kept private
@@ -339,6 +345,10 @@ class PathAnalyzer:
         # Check for three-part catalog table name: catalog.schema.table
         if self.__uc_catalog_table_regex.match(path):
             return 'table'
+        
+        # Check for table reference: catalog.schema.table or schema.table
+        if self.__uc_table_reference_regex.match(path):
+            return 'table_reference'
         
         # Check for system schemas
         for regex in self.__uc_system_schema_regexes:
