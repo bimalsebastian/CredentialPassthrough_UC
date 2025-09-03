@@ -62,6 +62,57 @@ os.environ['PASSTHROUGH_CACHE_TOKENS'] = 'True'
 os.environ['PASSTHROUGH_STORAGE_URL'] = 'https://yourstorageaccount.dfs.core.windows.net'
 ```
 
+### Security Recommendations
+
+**IMPORTANT**: Environment variables can be modified at runtime by user code, potentially compromising security. For production deployments, consider these approaches:
+
+#### Option 1: Hardcode Configuration (Recommended for Production)
+```python
+from uc_passthrough_library import UCPassthroughDataFrameReader
+
+# Hardcode secure configuration to prevent runtime tampering
+config = {
+    'client_id': 'your-service-principal-client-id',
+    'client_secret': 'your-service-principal-secret',
+    'tenant_id': 'your-azure-tenant-id',
+    'use_client_credentials': True,
+    'cache_tokens': True
+}
+
+# Pass config directly to prevent environment variable manipulation
+auth_manager = AuthenticationManager(config)
+spark_passthrough = UCPassthroughDataFrameReader(spark, auth_manager)
+```
+
+#### Option 2: Environment Variable Protection
+Use Databricks secrets or other secure configuration management:
+
+```python
+import os
+
+# Use Databricks secrets (more secure than plain environment variables)
+os.environ['PASSTHROUGH_CLIENT_ID'] = dbutils.secrets.get(scope="your-scope", key="client-id")
+os.environ['PASSTHROUGH_CLIENT_SECRET'] = dbutils.secrets.get(scope="your-scope", key="client-secret")
+os.environ['PASSTHROUGH_TENANT_ID'] = dbutils.secrets.get(scope="your-scope", key="tenant-id")
+
+# Lock authentication method to prevent runtime changes
+os.environ['PASSTHROUGH_USE_CLIENT_CREDENTIALS'] = 'True'
+os.environ['PASSTHROUGH_USE_INTERACTIVE_FLOW'] = 'False'
+```
+
+#### Option 3: Init Script Configuration
+Place configuration in cluster init scripts where user code cannot modify it:
+
+```bash
+#!/bin/bash
+# In cluster init script
+export PASSTHROUGH_CLIENT_ID="your-service-principal-client-id"
+export PASSTHROUGH_CLIENT_SECRET="your-service-principal-secret" 
+export PASSTHROUGH_TENANT_ID="your-azure-tenant-id"
+export PASSTHROUGH_USE_CLIENT_CREDENTIALS="True"
+export PASSTHROUGH_CACHE_TOKENS="True"
+```
+
 ### Authentication Modes
 
 **IMPORTANT**: Use only ONE authentication method at a time.
