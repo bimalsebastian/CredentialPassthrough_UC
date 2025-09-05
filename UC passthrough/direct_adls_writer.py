@@ -78,11 +78,6 @@ def _protect_adls_method(method):
 def _adls_gen2_safe_upload(file_client: DataLakeFileClient, data, overwrite: bool = True):
     """
     Upload data to ADLS Gen2 using the correct Data Lake API sequence.
-    This avoids the x-ms-blob-type header issue by using Data Lake APIs instead of Blob APIs.
-    
-    The issue occurs because ADLS Gen2 has dual API compatibility and upload_data() 
-    sometimes routes to the Blob API which requires x-ms-blob-type header.
-    Using create_file → append_data → flush_data sequence uses Data Lake API directly.
     
     Args:
         file_client: DataLakeFileClient instance
@@ -94,22 +89,22 @@ def _adls_gen2_safe_upload(file_client: DataLakeFileClient, data, overwrite: boo
         if isinstance(data, str):
             data = data.encode('utf-8')
         
-        # Step 1: Handle existing file if overwrite is requested
-        if overwrite:
-            try:
-                file_client.delete_file()
-                logger.debug("Deleted existing file for overwrite")
-            except Exception:
-                pass  # File might not exist, that's fine
+        # # Step 1: Handle existing file if overwrite is requested
+        # if overwrite:
+        #     try:
+        #         file_client.delete_file()
+        #         logger.debug("Deleted existing file for overwrite")
+        #     except Exception:
+        #         pass  # File might not exist, that's fine
         
-        # Step 2: Create the file using Data Lake API (this sets correct headers internally)
-        file_client.create_file()
-        logger.debug("Created file using Data Lake API")
+        # # Step 2: Create the file using Data Lake API (this sets correct headers internally)
+        # file_client.create_file()
+        # logger.debug("Created file using Data Lake API")
         
         # Step 3: Upload data if there is any
         if data and len(data) > 0:
             # Append the data
-            file_client.append_data(data, offset=0, length=len(data))
+            file_client.upload_data(data, overwrite)
             logger.debug(f"Appended {len(data)} bytes of data")
             
             # Flush/commit the data (this is crucial!)
