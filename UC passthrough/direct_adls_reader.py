@@ -220,7 +220,7 @@ class DirectADLSReader:
                         
                         # Create file record (similar to Spark's binaryFile format)
                         file_record = {
-                            'path': f"abfss://{container}@{self.__adls_client.account_name}.dfs.core.windows.net/{file_path}",
+                            'path': f"abfss://{container}@{self.__adls_client.account_name}.blob.core.windows.net/{file_path}",
                             'modificationTime': properties.last_modified,
                             'length': properties.size,
                             'content': content_bytes
@@ -289,7 +289,7 @@ class DirectADLSReader:
                         if multiline:
                             # Single JSON object per file
                             json_obj = json.loads(content_text)
-                            json_obj['_file_path'] = f"abfss://{container}@{self.__adls_client.account_name}.dfs.core.windows.net/{file_path}"
+                            json_obj['_file_path'] = f"abfss://{container}@{self.__adls_client.account_name}.blob.core.windows.net/{file_path}"
                             all_json_data.append(json_obj)
                         else:
                             # JSON Lines format (one JSON per line)
@@ -297,7 +297,7 @@ class DirectADLSReader:
                                 if line.strip():
                                     try:
                                         json_obj = json.loads(line)
-                                        json_obj['_file_path'] = f"abfss://{container}@{self.__adls_client.account_name}.dfs.core.windows.net/{file_path}"
+                                        json_obj['_file_path'] = f"abfss://{container}@{self.__adls_client.account_name}.blob.core.windows.net/{file_path}"
                                         json_obj['_line_number'] = line_num + 1
                                         all_json_data.append(json_obj)
                                     except json.JSONDecodeError as e:
@@ -375,7 +375,7 @@ class DirectADLSReader:
                         )
                         
                         # Add file path column
-                        csv_data['_file_path'] = f"abfss://{container}@{self.__adls_client.account_name}.dfs.core.windows.net/{file_path}"
+                        csv_data['_file_path'] = f"abfss://{container}@{self.__adls_client.account_name}.blob.core.windows.net/{file_path}"
                         
                         all_csv_data.append(csv_data)
                         
