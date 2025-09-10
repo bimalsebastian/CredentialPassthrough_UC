@@ -114,6 +114,8 @@ class AuthenticationManager:
     """
     
     # Private constants
+    # __BLOB_SCOPE = "https://storage.azure.com/user_impersonation"
+    # __ADLS_SCOPE = "https://datalake.azure.net/user_impersonation"
     __ADLS_SCOPE = "https://storage.azure.com/.default"
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -328,8 +330,10 @@ class AuthenticationManager:
         
         try:
             if self.__use_client_credentials:
+                # result = self.__msal_app.acquire_token_for_client(scopes=[self.__BLOB_SCOPE,self.__ADLS_SCOPE])
                 result = self.__msal_app.acquire_token_for_client(scopes=[self.__ADLS_SCOPE])
             elif self.__use_interactive_flow:
+                # result = self.__get_user_token_interactive_azure_ad(scopes=[self.__BLOB_SCOPE,self.__ADLS_SCOPE])
                 result = self.__get_user_token_interactive_azure_ad(scopes=[self.__ADLS_SCOPE])
             else:
                 raise RuntimeError("No valid authentication method configured")
