@@ -8,6 +8,7 @@ All authentication mechanisms and sensitive operations are protected from user m
 Implements transaction-like behavior for write safety and rollback capabilities.
 
 UPDATED: Fixed ADLS Gen2 x-ms-blob-type header issue by using proper Data Lake API sequence.
+UPDATED: Modified to preserve original filenames instead of generating new ones.
 """
 
 import io
@@ -75,7 +76,7 @@ def _protect_adls_method(method):
     return wrapper
 
 
-def _adls_gen2_safe_upload(file_client: DataLakeFileClient, data, overwrite: bool = True):
+def _adls_gen2_safe_upload(file_client: DataLakeFileClient, data, Is_overwrite: bool = False):
     """
     Upload data to ADLS Gen2 using the correct Data Lake API sequence.
     
@@ -104,7 +105,8 @@ def _adls_gen2_safe_upload(file_client: DataLakeFileClient, data, overwrite: boo
         # Step 3: Upload data if there is any
         if data and len(data) > 0:
             # Append the data
-            file_client.upload_data(data, overwrite)
+            # print(f"Uploading {len(data)} bytes of data...as {file_client.url} with overwrite: {Is_overwrite}")
+            file_client.upload_data(data, overwrite=Is_overwrite)
             logger.debug(f"Appended {len(data)} bytes of data")
             
             # Flush/commit the data (this is crucial!)
@@ -280,7 +282,7 @@ class WriteTransactionContext:
                     # Copy data using safe upload method
                     download = source_client.download_file()
                     data = download.readall()
-                    _adls_gen2_safe_upload(dest_client, data, overwrite=True)
+                    _adls_gen2_safe_upload(dest_client, data, True)
             
             # Delete source after successful copy
             self._delete_path(source_path)
@@ -297,11 +299,18 @@ class WriteTransactionContext:
             
             for source_file in source_paths:
                 if not source_file.is_directory:
-                    # Generate unique filename for append
-                    filename = source_file.name.split('/')[-1]
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    unique_filename = f"part-{timestamp}-{self.transaction_id}-{filename}"
-                    dest_file_path = f"{dest_path}/{unique_filename}"
+                    # Extract original filename from source
+                    original_filename = source_file.name.split('/')[-1]
+                    
+                    # For append mode, preserve original filename but ensure uniqueness
+                    dest_file_path = f"{dest_path}/{original_filename}"
+                    
+                    # Check if file already exists and make unique if needed
+                    counter = 1
+                    base_name, ext = os.path.splitext(original_filename)
+                    while self._file_exists(dest_file_path):
+                        dest_file_path = f"{dest_path}/{base_name}_{counter}{ext}"
+                        counter += 1
                     
                     # Copy file to destination using safe upload method
                     source_client = self.file_system_client.get_file_client(source_file.name)
@@ -309,7 +318,7 @@ class WriteTransactionContext:
                     
                     download = source_client.download_file()
                     data = download.readall()
-                    _adls_gen2_safe_upload(dest_client, data, overwrite=True)
+                    _adls_gen2_safe_upload(dest_client, data, True)
             
             # Delete source after successful merge
             self._delete_path(source_path)
@@ -317,6 +326,17 @@ class WriteTransactionContext:
         except Exception as e:
             logger.error(f"Failed to merge path {source_path} into {dest_path}: {str(e)}")
             raise
+    
+    def _file_exists(self, file_path: str) -> bool:
+        """Check if a specific file exists."""
+        try:
+            file_client = self.file_system_client.get_file_client(file_path)
+            file_client.get_file_properties()
+            return True
+        except ResourceNotFoundError:
+            return False
+        except Exception:
+            return False
     
     def _delete_path(self, path: str):
         """Delete a path and all its contents."""
@@ -351,6 +371,7 @@ class DirectADLSWriter:
     
     All authentication mechanisms and ADLS client access is protected from user manipulation.
     UPDATED: Uses correct ADLS Gen2 API sequence to avoid x-ms-blob-type header issues.
+    UPDATED: Modified to preserve original filenames instead of generating new ones.
     """
     
     def __init__(self, adls_client: DataLakeServiceClient, spark_session: SparkSession):
@@ -396,25 +417,20 @@ class DirectADLSWriter:
                 safe_options = self._filter_sensitive_options(options)
                 encoding = safe_options.get('encoding', 'utf-8')
                 
-                # Use transaction context for safety
-                with WriteTransactionContext(file_system_client, blob_path, mode, self.__adls_client.account_name) as tx:
-                    if tx.committed:  # Skip if ignore mode and target exists
-                        return
-                    
-                    write_path = tx.get_temp_path()
-                    
-                    if partition_columns:
-                        self._write_partitioned_text_files(dataframe, file_system_client, write_path,
-                                                         partition_columns, encoding, safe_options)
-                    else:
-                        self._write_single_text_file(dataframe, file_system_client, write_path,
-                                                   encoding, safe_options)
+                # Write directly to target path without creating temp subdirectory
+                if partition_columns:
+                    self._write_partitioned_text_files(dataframe, file_system_client, blob_path,
+                                                     partition_columns, encoding, safe_options)
+                else:
+                    self._write_single_text_file(dataframe, file_system_client, blob_path,
+                                               encoding, safe_options)
                 
                 logger.info(f"Successfully wrote text files to {blob_path} (mode: {mode})")
                 
         except Exception as e:
             logger.error(f"Failed to write text files to {blob_path}: {str(e)}")
             raise RuntimeError(f"Text file writing failed: {str(e)}")
+
     
     @_protect_adls_method  
     def write_json_files(self, dataframe: DataFrame, container: str, blob_path: str,
@@ -439,20 +455,14 @@ class DirectADLSWriter:
                 # Filter sensitive options
                 safe_options = self._filter_sensitive_options(options)
                 
-                # Use transaction context for safety
-                with WriteTransactionContext(file_system_client, blob_path, mode, self.__adls_client.account_name) as tx:
-                    if tx.committed:  # Skip if ignore mode and target exists
-                        return
-                    
-                    write_path = tx.get_temp_path()
-                    
-                    if partition_columns:
-                        self._write_partitioned_json_files(dataframe, file_system_client, write_path,
-                                                         partition_columns, safe_options)
-                    else:
-                        self._write_single_json_file(dataframe, file_system_client, write_path, safe_options)
+                if partition_columns:
+                    self._write_partitioned_json_files(dataframe, file_system_client, blob_path,
+                                                        partition_columns, safe_options)
+                else:
+                    self._write_single_json_file(dataframe, file_system_client, blob_path, safe_options)
                 
-                logger.info(f"Successfully wrote JSON files to {blob_path} (mode: {mode})")
+                logger.info(f"Successfully wrote text files to {blob_path} (mode: {mode})")
+
                 
         except Exception as e:
             logger.error(f"Failed to write JSON files to {blob_path}: {str(e)}")
@@ -522,18 +532,12 @@ class DirectADLSWriter:
                 # Filter sensitive options
                 safe_options = self._filter_sensitive_options(options)
                 
-                # Use transaction context for safety
-                with WriteTransactionContext(file_system_client, blob_path, mode, self.__adls_client.account_name) as tx:
-                    if tx.committed:  # Skip if ignore mode and target exists
-                        return
-                    
-                    write_path = tx.get_temp_path()
-                    
-                    if partition_columns:
-                        self._write_partitioned_csv_files(dataframe, file_system_client, write_path,
+                if partition_columns:
+                    self._write_partitioned_csv_files(dataframe, file_system_client, blob_path,
                                                         partition_columns, safe_options)
-                    else:
-                        self._write_single_csv_file(dataframe, file_system_client, write_path, safe_options)
+                else:
+                    self._write_single_csv_file(dataframe, file_system_client, blob_path, safe_options)
+                    
                 
                 logger.info(f"Successfully wrote CSV files to {blob_path} (mode: {mode})")
                 
@@ -549,6 +553,7 @@ class DirectADLSWriter:
                 pandas_df = dataframe.toPandas()
                 
                 # Extract CSV options with defaults
+                overwrite = options.get('overwrite', True)
                 header = options.get('header', True)
                 separator = options.get('sep', ',')
                 quote_char = options.get('quote', '"')
@@ -572,17 +577,20 @@ class DirectADLSWriter:
                     date_format=date_format
                 )
                 
-                csv_content = csv_buffer.getvalue()
+                csv_content = csv_buffer.getvalue().encode('utf-8')
                 csv_buffer.close()
                 
-                # Create target file
-                filename = "part-00000.csv"
-                file_path = f"{target_path}/{filename}"
+                # Use original filename or default if not provided
+                # filename = options.get('filename', 'data.csv')
+                # file_path = f"{target_path}/{filename}"
+                file_path = target_path
+                # print(f"Writing CSV file: {file_path}")
                 
                 # Upload CSV content using safe ADLS Gen2 method
                 file_client = file_system_client.get_file_client(file_path)
-                _adls_gen2_safe_upload(file_client, csv_content, overwrite=True)
-                
+                _adls_gen2_safe_upload(file_client, csv_content, overwrite)
+               
+
                 logger.debug(f"Wrote CSV file: {file_path} ({len(csv_content)} bytes)")
                 
             except Exception as e:
@@ -649,14 +657,18 @@ class DirectADLSWriter:
             for idx, row in pandas_df.iterrows():
                 # Extract original filename from path
                 original_path = row['path']
-                filename = original_path.split('/')[-1] if '/' in original_path else f"binary_file_{idx}.bin"
+                filename = original_path.split('/')[-1] if '/' in original_path else original_path
+                
+                # If filename is empty or just a path separator, create a default name
+                if not filename or filename in ['/', '\\']:
+                    filename = f"binary_file_{idx}.bin"
                 
                 # Create target file path
                 target_file_path = f"{target_path}/{filename}"
                 
                 # Upload binary content using safe method
                 file_client = file_system_client.get_file_client(target_file_path)
-                _adls_gen2_safe_upload(file_client, row['content'], overwrite=True)
+                _adls_gen2_safe_upload(file_client, row['content'], True)
                 
                 logger.debug(f"Wrote binary file: {target_file_path}")
                 
@@ -690,14 +702,14 @@ class DirectADLSWriter:
                 for idx, row in group_df.iterrows():
                     # Extract original filename from path
                     original_path = row['path']
-                    filename = original_path.split('/')[-1] if '/' in original_path else f"binary_file_{idx}.bin"
+                    filename = original_path.split('/')[-1] if '/' in original_path else original_path
                     
                     # Create partition file path
                     file_path = f"{full_partition_path}/{filename}"
                     
                     # Upload binary content
                     file_client = file_system_client.get_file_client(file_path)
-                    _adls_gen2_safe_upload(file_client, row['content'], overwrite=True)
+                    _adls_gen2_safe_upload(file_client, row['content'], True)
                     
                     logger.debug(f"Wrote partitioned binary file: {file_path}")
                     
@@ -727,7 +739,7 @@ class DirectADLSWriter:
             file_client = file_system_client.get_file_client(file_path)
             
             # Upload text content using safe ADLS Gen2 method
-            _adls_gen2_safe_upload(file_client, text_content, overwrite=True)
+            _adls_gen2_safe_upload(file_client, text_content, True)
             
             logger.debug(f"Wrote text file: {file_path}")
             
@@ -771,7 +783,7 @@ class DirectADLSWriter:
                 file_path = f"{full_partition_path}/{filename}"
                 
                 file_client = file_system_client.get_file_client(file_path)
-                _adls_gen2_safe_upload(file_client, text_content, overwrite=True)
+                _adls_gen2_safe_upload(file_client, text_content, True)
                 
                 logger.debug(f"Wrote partitioned text file: {file_path}")
                 
