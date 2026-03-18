@@ -167,7 +167,7 @@ To configure in Azure Portal:
 8. Click "Grant admin consent for [Your Organization]" (requires Global Admin)
 ```
 2. **Allow public client flows**: 
-<img width="871" height="239" alt="image" src="https://github.com/user-attachments/assets/190ff201-483a-4e2c-9d0e-ccd68e5ee66f" />
+
 To configure in Azure Portal:
 ```
 1. Navigate to Azure AD > App registrations > [Your Service Principal]
@@ -175,7 +175,7 @@ To configure in Azure Portal:
 3. Go to tab "Settings"
 4. Toggle "Allow public client flows" to enabled
 ```
-
+<img width="871" height="239" alt="image" src="https://github.com/user-attachments/assets/190ff201-483a-4e2c-9d0e-ccd68e5ee66f" />
 #### Required ADLS Permissions
 The Service Principal also needs appropriate RBAC roles on the ADLS storage account:
 - **Storage Blob Data Contributor** (or higher) on the storage account
