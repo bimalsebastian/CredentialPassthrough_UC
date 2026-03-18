@@ -143,6 +143,7 @@ class AuthenticationManager:
                 client_credential=self.client_secret,
                 authority=self.authority
             )
+            
         else:
             self.msal_app = msal.PublicClientApplication(
                 client_id=self.client_id,
@@ -319,11 +320,15 @@ class AuthenticationManager:
             if accounts:
                 result = self.msal_app.acquire_token_silent(scopes, account=accounts[0])
                 if result and "access_token" in result:
-                    print("✓ Got token silently")
-                    return {
-                        'access_token': result['access_token'],
-                        'expires_at': int(time.time()) + result['expires_in']
-                    }
+                    # Validate it's actually a user token before returning
+                    parts = result['access_token'].split('.')
+                    import base64, json
+                    payload = json.loads(base64.b64decode(parts[1] + '=='))
+                    if payload.get('upn') or payload.get('unique_name'):
+                        logger.debug("Got valid user token silently")
+                        return result
+                    else:
+                        logger.warning("Silent token has no upn — forcing device flow")
             
             # Interactive login with device code (works in notebooks)
             flow = self.msal_app.initiate_device_flow(scopes=scopes)
@@ -577,41 +582,3 @@ class AuthenticationManager:
         
         return warnings
 
-
-# # Example usage and testing
-# if __name__ == "__main__":
-#     # Configure logging
-#     logging.basicConfig(level=logging.INFO)
-    
-#     # Example configuration (use your actual Azure AD Service Principal)
-#     config = {
-#         'client_id': '12345678-1234-1234-1234-123456789012',  # Your Service Principal client ID
-#         'client_secret': 'your-service-principal-secret',     # Your Service Principal client secret
-#         'tenant_id': '87654321-4321-4321-4321-210987654321',  # Your Azure AD tenant ID
-#         'cache_tokens': True,
-#         'use_client_credentials': True  # Use client credentials flow with admin consent
-#     }
-    
-#     try:
-#         # Create authentication manager
-#         auth_manager = AuthenticationManager(config)
-        
-#         # Validate configuration
-#         warnings = auth_manager.validate_configuration()
-#         if warnings:
-#             print("Configuration warnings:")
-#             for warning in warnings:
-#                 print(f"  - {warning}")
-        
-#         print("AuthenticationManager created successfully")
-#         print(f"MSAL Authority: {auth_manager.authority}")
-#         print(f"Token caching: {'Enabled' if auth_manager.cache_enabled else 'Disabled'}")
-#         print(f"Auth method: {'Client Credentials (SPN)' if auth_manager.use_client_credentials else 'OBO Flow'}")
-        
-#         # Example of how it would be used in Databricks:
-#         # auth_manager.initialize_user_context()
-#         # adls_client = auth_manager.get_adls_client("https://mystorageaccount.dfs.core.windows.net")
-#         # test_result = auth_manager.test_adls_access("https://mystorageaccount.dfs.core.windows.net", "mycontainer")
-        
-#     except Exception as e:
-#         print(f"Error: {str(e)}")
