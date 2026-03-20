@@ -21,7 +21,7 @@ This library solves the challenge of accessing unstructured files (CSV, JSON, im
 
 ```python
 # Install required dependencies
-pip install msal azure-storage-file-datalake azure-identity pandas chardet
+pip install msal azure-storage-file-datalake azure-identity pandas chardet fastavro
 ```
 
 ## Quick Start
