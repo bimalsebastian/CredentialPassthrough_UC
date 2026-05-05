@@ -410,36 +410,40 @@ class DirectADLSWriter:
             options: Additional writing options
         """
         try:
-            with self.__lock:  # Thread-safe access to ADLS client
+            with self.__lock:
                 file_system_client = self.__adls_client.get_file_system_client(container)
-                
-                # Filter sensitive options
                 safe_options = self._filter_sensitive_options(options)
                 encoding = safe_options.get('encoding', 'utf-8')
-                
-                # Write directly to target path without creating temp subdirectory
-                if partition_columns:
-                    self._write_partitioned_text_files(dataframe, file_system_client, blob_path,
-                                                     partition_columns, encoding, safe_options)
-                else:
-                    self._write_single_text_file(dataframe, file_system_client, blob_path,
-                                               encoding, safe_options)
-                
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+                    if partition_columns:
+                        self._write_partitioned_text_files(
+                            dataframe, file_system_client, write_path,
+                            partition_columns, encoding, safe_options)
+                    else:
+                        self._write_single_text_file(
+                            dataframe, file_system_client, write_path, encoding, safe_options)
+
                 logger.info(f"Successfully wrote text files to {blob_path} (mode: {mode})")
-                
+
         except Exception as e:
             logger.error(f"Failed to write text files to {blob_path}: {str(e)}")
             raise RuntimeError(f"Text file writing failed: {str(e)}")
 
     
-    @_protect_adls_method  
+    @_protect_adls_method
     def write_json_files(self, dataframe: DataFrame, container: str, blob_path: str,
                         mode: str = 'error', partition_columns: List[str] = None,
                         options: Optional[Dict] = None) -> None:
         """
         Protected method to write JSON files directly to ADLS.
         This method is protected from direct user access.
-        
+
         Args:
             dataframe: DataFrame to write
             container: ADLS container name
@@ -449,24 +453,86 @@ class DirectADLSWriter:
             options: Additional writing options
         """
         try:
-            with self.__lock:  # Thread-safe access to ADLS client
+            with self.__lock:
                 file_system_client = self.__adls_client.get_file_system_client(container)
-                
-                # Filter sensitive options
                 safe_options = self._filter_sensitive_options(options)
-                
-                if partition_columns:
-                    self._write_partitioned_json_files(dataframe, file_system_client, blob_path,
-                                                        partition_columns, safe_options)
-                else:
-                    self._write_single_json_file(dataframe, file_system_client, blob_path, safe_options)
-                
-                logger.info(f"Successfully wrote text files to {blob_path} (mode: {mode})")
 
-                
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+                    if partition_columns:
+                        self._write_partitioned_json_files(
+                            dataframe, file_system_client, write_path,
+                            partition_columns, safe_options)
+                    else:
+                        self._write_single_json_file(
+                            dataframe, file_system_client, write_path, safe_options)
+
+                logger.info(f"Successfully wrote JSON files to {blob_path} (mode: {mode})")
+
         except Exception as e:
             logger.error(f"Failed to write JSON files to {blob_path}: {str(e)}")
             raise RuntimeError(f"JSON file writing failed: {str(e)}")
+
+    def _write_single_json_file(self, dataframe: DataFrame, file_system_client: FileSystemClient,
+                                target_path: str, options: Dict) -> None:
+        """Write DataFrame as a single JSON Lines file using ADLS Gen2 safe upload."""
+        try:
+            pandas_df = dataframe.toPandas()
+            orient = options.get('orient', 'records')
+            lines = options.get('lines', True)  # default to JSON Lines (one object per row)
+            date_format = options.get('dateFormat', 'iso')
+            null_value = options.get('nullValue', None)
+
+            buf = io.StringIO()
+            if lines:
+                pandas_df.to_json(buf, orient='records', lines=True,
+                                  date_format=date_format)
+            else:
+                pandas_df.to_json(buf, orient=orient, date_format=date_format)
+            content = buf.getvalue().encode('utf-8')
+            buf.close()
+
+            file_client = file_system_client.get_file_client(target_path)
+            _adls_gen2_safe_upload(file_client, content, True)
+            logger.debug(f"Wrote JSON file: {target_path} ({len(content)} bytes)")
+
+        except Exception as e:
+            logger.error(f"Failed to write single JSON file: {str(e)}")
+            raise
+
+    def _write_partitioned_json_files(self, dataframe: DataFrame,
+                                      file_system_client: FileSystemClient,
+                                      target_path: str, partition_columns: List[str],
+                                      options: Dict) -> None:
+        """Write DataFrame as partitioned JSON Lines files."""
+        try:
+            pandas_df = dataframe.toPandas()
+            date_format = options.get('dateFormat', 'iso')
+            grouped = pandas_df.groupby(partition_columns)
+
+            for partition_values, group_df in grouped:
+                if len(partition_columns) == 1:
+                    partition_values = [partition_values]
+                partition_dir = "/".join(
+                    f"{col}={val}" for col, val in zip(partition_columns, partition_values)
+                )
+                full_partition_path = f"{target_path}/{partition_dir}/part-00000.json"
+                output_df = group_df.drop(columns=partition_columns)
+                buf = io.StringIO()
+                output_df.to_json(buf, orient='records', lines=True, date_format=date_format)
+                content = buf.getvalue().encode('utf-8')
+                buf.close()
+                file_client = file_system_client.get_file_client(full_partition_path)
+                _adls_gen2_safe_upload(file_client, content, True)
+                logger.debug(f"Wrote partitioned JSON file: {full_partition_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to write partitioned JSON files: {str(e)}")
+            raise
     def _filter_sensitive_options(self, options: Optional[Dict]) -> Dict:
         """
         Filter out sensitive authentication options that users shouldn't control directly.
@@ -516,7 +582,7 @@ class DirectADLSWriter:
         """
         Protected method to write CSV files directly to ADLS.
         This method is protected from direct user access.
-        
+
         Args:
             dataframe: DataFrame to write
             container: ADLS container name
@@ -526,21 +592,26 @@ class DirectADLSWriter:
             options: Additional writing options
         """
         try:
-            with self.__lock:  # Thread-safe access to ADLS client
+            with self.__lock:
                 file_system_client = self.__adls_client.get_file_system_client(container)
-                
-                # Filter sensitive options
                 safe_options = self._filter_sensitive_options(options)
-                
-                if partition_columns:
-                    self._write_partitioned_csv_files(dataframe, file_system_client, blob_path,
-                                                        partition_columns, safe_options)
-                else:
-                    self._write_single_csv_file(dataframe, file_system_client, blob_path, safe_options)
-                    
-                
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+                    if partition_columns:
+                        self._write_partitioned_csv_files(
+                            dataframe, file_system_client, write_path,
+                            partition_columns, safe_options)
+                    else:
+                        self._write_single_csv_file(
+                            dataframe, file_system_client, write_path, safe_options)
+
                 logger.info(f"Successfully wrote CSV files to {blob_path} (mode: {mode})")
-                
+
         except Exception as e:
             logger.error(f"Failed to write CSV files to {blob_path}: {str(e)}")
             raise RuntimeError(f"CSV file writing failed: {str(e)}")
@@ -596,6 +667,43 @@ class DirectADLSWriter:
             except Exception as e:
                 logger.error(f"Failed to write single CSV file: {str(e)}")
                 raise
+    def _write_partitioned_csv_files(self, dataframe: DataFrame,
+                                     file_system_client: FileSystemClient,
+                                     target_path: str, partition_columns: List[str],
+                                     options: Dict) -> None:
+        """Write DataFrame as partitioned CSV files."""
+        try:
+            pandas_df = dataframe.toPandas()
+            header = options.get('header', True)
+            separator = options.get('sep', ',')
+            quote_char = options.get('quote', '"')
+            escape_char = options.get('escape', '\\')
+            null_value = options.get('nullValue', '')
+            date_format = options.get('dateFormat', None)
+
+            grouped = pandas_df.groupby(partition_columns)
+            for partition_values, group_df in grouped:
+                if len(partition_columns) == 1:
+                    partition_values = [partition_values]
+                partition_dir = "/".join(
+                    f"{col}={val}" for col, val in zip(partition_columns, partition_values)
+                )
+                full_partition_path = f"{target_path}/{partition_dir}/part-00000.csv"
+                output_df = group_df.drop(columns=partition_columns)
+                buf = io.StringIO()
+                output_df.to_csv(buf, index=False, header=header, sep=separator,
+                                 quotechar=quote_char, escapechar=escape_char,
+                                 na_rep=null_value, date_format=date_format)
+                content = buf.getvalue().encode('utf-8')
+                buf.close()
+                file_client = file_system_client.get_file_client(full_partition_path)
+                _adls_gen2_safe_upload(file_client, content, True)
+                logger.debug(f"Wrote partitioned CSV file: {full_partition_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to write partitioned CSV files: {str(e)}")
+            raise
+
     @_protect_adls_method
     def write_binary_files(self, dataframe: DataFrame, container: str, blob_path: str,
                         mode: str = 'error', partition_columns: List[str] = None,
@@ -790,14 +898,266 @@ class DirectADLSWriter:
         except Exception as e:
             logger.error(f"Failed to write partitioned text files: {str(e)}")
             raise
+    @_protect_adls_method
+    def write_parquet_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                            mode: str = 'error', partition_columns: List[str] = None,
+                            options: Optional[Dict] = None) -> None:
+        """
+        Write DataFrame as Parquet files directly to ADLS via PyArrow.
+
+        Supports all standard Parquet write options:
+          compression  - 'snappy' (default), 'gzip', 'brotli', 'zstd', 'none'
+          row_group_size - rows per row group
+        """
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+
+                    compression = safe_options.get('compression', 'snappy')
+                    row_group_size = safe_options.get('row_group_size', None)
+                    pandas_df = dataframe.toPandas()
+                    arrow_table = pa.Table.from_pandas(pandas_df)
+
+                    if partition_columns:
+                        self._write_partitioned_parquet(
+                            arrow_table, file_system_client, write_path,
+                            partition_columns, compression, row_group_size)
+                    else:
+                        self._write_single_parquet(
+                            arrow_table, file_system_client, write_path,
+                            compression, row_group_size)
+
+                logger.info(f"Successfully wrote Parquet files to {blob_path} (mode: {mode})")
+
+        except ImportError:
+            raise RuntimeError("PyArrow required for Parquet writing: pip install pyarrow")
+        except Exception as e:
+            logger.error(f"Failed to write Parquet files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"Parquet file writing failed: {str(e)}")
+
+    def _write_single_parquet(self, arrow_table, file_system_client: FileSystemClient,
+                              target_path: str, compression: str,
+                              row_group_size: Optional[int]) -> None:
+        """Serialise an Arrow table to a Parquet buffer and upload to ADLS."""
+        import pyarrow.parquet as pq
+        buf = io.BytesIO()
+        kwargs = {'compression': compression}
+        if row_group_size:
+            kwargs['row_group_size'] = row_group_size
+        pq.write_table(arrow_table, buf, **kwargs)
+        file_client = file_system_client.get_file_client(target_path)
+        _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+        logger.debug(f"Wrote Parquet file: {target_path} ({buf.tell()} bytes)")
+
+    def _write_partitioned_parquet(self, arrow_table, file_system_client: FileSystemClient,
+                                   target_path: str, partition_columns: List[str],
+                                   compression: str, row_group_size: Optional[int]) -> None:
+        """Write partitioned Parquet files using Hive-style directory layout."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import pandas as pd
+
+        pandas_df = arrow_table.to_pandas()
+        grouped = pandas_df.groupby(partition_columns)
+
+        for partition_values, group_df in grouped:
+            if len(partition_columns) == 1:
+                partition_values = [partition_values]
+            partition_dir = "/".join(
+                f"{col}={val}" for col, val in zip(partition_columns, partition_values)
+            )
+            output_df = group_df.drop(columns=partition_columns)
+            part_table = pa.Table.from_pandas(output_df)
+            buf = io.BytesIO()
+            kwargs = {'compression': compression}
+            if row_group_size:
+                kwargs['row_group_size'] = row_group_size
+            pq.write_table(part_table, buf, **kwargs)
+            file_path = f"{target_path}/{partition_dir}/part-00000.parquet"
+            file_client = file_system_client.get_file_client(file_path)
+            _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+            logger.debug(f"Wrote partitioned Parquet: {file_path}")
+
+    @_protect_adls_method
+    def write_orc_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                        mode: str = 'error', partition_columns: List[str] = None,
+                        options: Optional[Dict] = None) -> None:
+        """
+        Write DataFrame as ORC files directly to ADLS via PyArrow.
+
+        Supports:
+          compression - 'zlib' (default), 'snappy', 'lz4', 'zstd', 'none'
+        """
+        try:
+            import pyarrow as pa
+            import pyarrow.orc as orc
+
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+
+                    compression = safe_options.get('compression', 'zlib')
+                    pandas_df = dataframe.toPandas()
+                    arrow_table = pa.Table.from_pandas(pandas_df)
+
+                    if partition_columns:
+                        self._write_partitioned_orc(
+                            arrow_table, file_system_client, write_path,
+                            partition_columns, compression)
+                    else:
+                        self._write_single_orc(
+                            arrow_table, file_system_client, write_path, compression)
+
+                logger.info(f"Successfully wrote ORC files to {blob_path} (mode: {mode})")
+
+        except ImportError:
+            raise RuntimeError("PyArrow required for ORC writing: pip install pyarrow")
+        except Exception as e:
+            logger.error(f"Failed to write ORC files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"ORC file writing failed: {str(e)}")
+
+    def _write_single_orc(self, arrow_table, file_system_client: FileSystemClient,
+                          target_path: str, compression: str) -> None:
+        import pyarrow.orc as orc
+        buf = io.BytesIO()
+        orc.write_table(arrow_table, buf, compression=compression)
+        file_client = file_system_client.get_file_client(target_path)
+        _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+        logger.debug(f"Wrote ORC file: {target_path}")
+
+    def _write_partitioned_orc(self, arrow_table, file_system_client: FileSystemClient,
+                               target_path: str, partition_columns: List[str],
+                               compression: str) -> None:
+        import pyarrow as pa
+        import pyarrow.orc as orc
+        pandas_df = arrow_table.to_pandas()
+        grouped = pandas_df.groupby(partition_columns)
+        for partition_values, group_df in grouped:
+            if len(partition_columns) == 1:
+                partition_values = [partition_values]
+            partition_dir = "/".join(
+                f"{col}={val}" for col, val in zip(partition_columns, partition_values)
+            )
+            output_df = group_df.drop(columns=partition_columns)
+            part_table = pa.Table.from_pandas(output_df)
+            buf = io.BytesIO()
+            orc.write_table(part_table, buf, compression=compression)
+            file_path = f"{target_path}/{partition_dir}/part-00000.orc"
+            file_client = file_system_client.get_file_client(file_path)
+            _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+            logger.debug(f"Wrote partitioned ORC: {file_path}")
+
+    @_protect_adls_method
+    def write_avro_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                         mode: str = 'error', partition_columns: List[str] = None,
+                         options: Optional[Dict] = None) -> None:
+        """
+        Write DataFrame as Avro files directly to ADLS via fastavro.
+
+        Supports:
+          codec - 'null' (default), 'deflate', 'snappy', 'bzip2'
+        """
+        try:
+            import fastavro
+
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+
+                    codec = safe_options.get('codec', 'null')
+                    pandas_df = dataframe.toPandas()
+
+                    if partition_columns:
+                        self._write_partitioned_avro(
+                            pandas_df, file_system_client, write_path,
+                            partition_columns, codec)
+                    else:
+                        self._write_single_avro(
+                            pandas_df, file_system_client, write_path, codec)
+
+                logger.info(f"Successfully wrote Avro files to {blob_path} (mode: {mode})")
+
+        except ImportError:
+            raise RuntimeError("fastavro required for Avro writing: pip install fastavro")
+        except Exception as e:
+            logger.error(f"Failed to write Avro files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"Avro file writing failed: {str(e)}")
+
+    def _write_single_avro(self, pandas_df, file_system_client: FileSystemClient,
+                           target_path: str, codec: str) -> None:
+        import fastavro
+        records = pandas_df.to_dict(orient='records')
+        if not records:
+            raise RuntimeError("Cannot infer Avro schema from empty DataFrame")
+        schema = fastavro.parse_schema(
+            fastavro.schema.parse_schema(
+                {"type": "record", "name": "Row",
+                 "fields": [{"name": k, "type": ["null", "string"]} for k in pandas_df.columns]}
+            )
+        )
+        buf = io.BytesIO()
+        fastavro.writer(buf, schema, records, codec=codec)
+        file_client = file_system_client.get_file_client(target_path)
+        _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+        logger.debug(f"Wrote Avro file: {target_path}")
+
+    def _write_partitioned_avro(self, pandas_df, file_system_client: FileSystemClient,
+                                target_path: str, partition_columns: List[str],
+                                codec: str) -> None:
+        import fastavro
+        grouped = pandas_df.groupby(partition_columns)
+        for partition_values, group_df in grouped:
+            if len(partition_columns) == 1:
+                partition_values = [partition_values]
+            partition_dir = "/".join(
+                f"{col}={val}" for col, val in zip(partition_columns, partition_values)
+            )
+            output_df = group_df.drop(columns=partition_columns)
+            records = output_df.to_dict(orient='records')
+            schema = fastavro.parse_schema(
+                {"type": "record", "name": "Row",
+                 "fields": [{"name": k, "type": ["null", "string"]} for k in output_df.columns]}
+            )
+            buf = io.BytesIO()
+            fastavro.writer(buf, schema, records, codec=codec)
+            file_path = f"{target_path}/{partition_dir}/part-00000.avro"
+            file_client = file_system_client.get_file_client(file_path)
+            _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+            logger.debug(f"Wrote partitioned Avro: {file_path}")
+
     def validate_dataframe_for_format(self, dataframe: DataFrame, format_type: str) -> List[str]:
         """
         Validate DataFrame schema compatibility with target format.
-        
+
         Args:
             dataframe: DataFrame to validate
             format_type: Target format ('csv', 'json', 'text', 'binaryfile')
-            
+
         Returns:
             List of validation warnings/errors
         """
@@ -865,11 +1225,18 @@ class DirectADLSWriter:
                 'estimated_size_mb': -1
             }
 
+    def get_supported_write_operations(self) -> List[str]:
+        """Return the list of supported write format operations."""
+        return ['csv', 'json', 'text', 'binaryfile', 'parquet', 'orc', 'avro']
+
+    def get_supported_write_modes(self) -> List[str]:
+        """Return the list of supported write modes."""
+        return ['overwrite', 'append', 'ignore', 'error']
+
     def get_write_statistics(self) -> Dict[str, Any]:
         """
         Get statistics about write operations performed by this writer instance.
         """
-        # This would require adding instance variables to track stats
         return {
             'operations_supported': self.get_supported_write_operations(),
             'modes_supported': self.get_supported_write_modes(),
