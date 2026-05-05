@@ -34,6 +34,7 @@ except ImportError as e:
 
 from path_analyzer import PathAnalyzer
 from authentication_manager import AuthenticationManager
+from uc_passthrough_writer import UCPassthroughWriterProxy, _UCWriteDataFrame
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +330,49 @@ class UCPassthroughDataFrameReader:
     # ------------------------------------------------------------------ #
     #  Pass all other spark.* attributes straight through                  #
     # ------------------------------------------------------------------ #
+
+    # ── .write property ── intercepts spark.write just like spark.read ──────
+
+    @property
+    def write(self):
+        """
+        Returns a UCPassthroughWriterProxy configured with the current auth and
+        path analyzer.  Because writes require a DataFrame, the proxy is not
+        attached to one yet — use df.write (via patch_dataframe_write) for the
+        normal Spark workflow.
+
+        This property exists so that spark.write raises a clear error if called
+        directly without a DataFrame, matching native Spark behaviour.
+        """
+        raise AttributeError(
+            "spark.write requires a DataFrame. Use df.write instead. "
+            "Wrap your DataFrame with spark.patch_dataframe_write(df) to get "
+            "passthrough-aware write routing on df.write."
+        )
+
+    def patch_dataframe_write(self, dataframe) -> '_UCWriteDataFrame':
+        """
+        Wrap a DataFrame so that its .write property returns a
+        UCPassthroughWriterProxy instead of the native DataFrameWriter.
+
+        Usage::
+
+            df = spark.read.parquet('abfss://...')
+            df = spark.patch_dataframe_write(df)
+            df.write.mode('overwrite').parquet('abfss://other/path')
+
+        The returned object is a thin proxy — all DataFrame methods (show,
+        filter, join, cache, etc.) pass straight through to the underlying
+        DataFrame.  Only .write is intercepted.
+        """
+        return _UCWriteDataFrame(
+            dataframe=dataframe,
+            spark_session=object.__getattribute__(self, '_spark'),
+            auth_manager=object.__getattribute__(self, '_auth_manager'),
+            path_analyzer=object.__getattribute__(self, '_path_analyzer'),
+        )
+
+    # ── pass all other spark.* attributes straight through ───────────────────
 
     def __getattr__(self, name: str):
         spark = object.__getattribute__(self, '_spark')
