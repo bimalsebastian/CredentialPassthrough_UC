@@ -58,10 +58,10 @@ def _protect_adls_method(method):
         # Allow calls from within the same package or trusted modules
         trusted_modules = {
             'authentication_manager',
-            'direct_adls_reader', 
+            'direct_adls_reader',
             'direct_adls_writer',
             'uc_passthrough_library',
-            'uc_dataframe_writer',
+            'uc_passthrough_writer',   # write proxy — replaces old uc_dataframe_writer
             '__main__'  # Allow calls from main execution context
         }
         
@@ -1342,5 +1342,3 @@ class DirectADLSWriter:
             
             return wrapper
         return decorator
-
-        
