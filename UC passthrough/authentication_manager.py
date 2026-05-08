@@ -81,20 +81,34 @@ class TokenCache:
 
 
 class CustomCredential:
-    """Custom credential class that uses cached user tokens for ADLS access."""
-    
-    def __init__(self, access_token: str, expires_at: float):
-        self.access_token = access_token
-        self.expires_at = expires_at
-    
-    def get_token(self, *scopes, **kwargs) -> AccessToken:
-        """Return access token for Azure SDK."""
-        if time.time() >= self.expires_at:
-            raise ValueError("Token has expired")
-        
+    """
+    Azure SDK credential that auto-refreshes via AuthenticationManager.
+
+    The Azure SDK calls get_token() before every ADLS request.  Rather than
+    snapshotting a token at client-creation time (which causes expiry errors
+    mid-session), this credential holds a reference to the manager and
+    re-acquires a token on demand whenever the current one is within 5 minutes
+    of expiry.  The manager's TokenCache handles deduplication so there is no
+    extra network round-trip while the token remains valid.
+    """
+
+    def __init__(self, auth_manager: 'AuthenticationManager'):
+        self._auth_manager = auth_manager
+        # Eagerly fetch a token so any auth errors surface at construction time
+        self._refresh()
+
+    def _refresh(self):
+        token_data = self._auth_manager._get_adls_access_token()
+        self._access_token = token_data['access_token']
+        self._expires_at   = token_data['expires_at']
+
+    def get_token(self, *scopes, **kwargs) -> 'AccessToken':
+        """Return a valid access token, refreshing if within 5 minutes of expiry."""
+        if time.time() + 300 >= self._expires_at:
+            self._refresh()
         return AccessToken(
-            token=self.access_token,
-            expires_on=int(self.expires_at)
+            token=self._access_token,
+            expires_on=int(self._expires_at)
         )
 
 
@@ -112,6 +126,20 @@ class AuthenticationManager:
     
     # Azure AD scopes for different services
     ADLS_SCOPE = "https://storage.azure.com/.default"
+
+    @staticmethod
+    def _coerce_bool(value) -> bool:
+        """
+        Safely coerce a config value to bool.
+        Handles Python booleans, integers, and the string representations that
+        come from os.environ ('true', 'false', '1', '0', 'yes', 'no').
+        Non-empty strings are NOT treated as truthy — only recognised true-words are.
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return bool(value)
+        return str(value).strip().lower() in ('1', 'true', 'yes')
     
     def __init__(self, config: Dict[str, Any]):
         """
@@ -132,9 +160,9 @@ class AuthenticationManager:
         self.client_secret = config['client_secret']
         self.tenant_id = config['tenant_id']
         self.authority = config.get('authority', f"https://login.microsoftonline.com/{self.tenant_id}")
-        self.cache_enabled = config.get('cache_tokens', True)
-        self.use_client_credentials = config.get('use_client_credentials', False)
-        self.use_interactive_flow = config.get('use_interactive_flow', False)
+        self.cache_enabled = self._coerce_bool(config.get('cache_tokens', True))
+        self.use_client_credentials = self._coerce_bool(config.get('use_client_credentials', False))
+        self.use_interactive_flow = self._coerce_bool(config.get('use_interactive_flow', False))
         
         # Initialize MSAL confidential client
         if self.use_client_credentials:
@@ -218,15 +246,9 @@ class AuthenticationManager:
             raise RuntimeError("User context not initialized. Call initialize_user_context() first.")
         
         try:
-            # Get ADLS access token using Service Principal (acts on behalf of user)
-            access_token = self._get_adls_access_token()
-            
-            # Create custom credential
-            credential = CustomCredential(
-                access_token=access_token['access_token'],
-                expires_at=access_token['expires_at']
-            )
-            
+            # Create a self-refreshing credential — no static token snapshot
+            credential = CustomCredential(auth_manager=self)
+
             # Create and return ADLS client
             client = DataLakeServiceClient(
                 account_url=storage_account_url,
@@ -581,4 +603,3 @@ class AuthenticationManager:
             warnings.append("INFO: Service Principal requires admin consent for https://storage.azure.com/.default scope")
         
         return warnings
-
