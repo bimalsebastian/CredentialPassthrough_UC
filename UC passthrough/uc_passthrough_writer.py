@@ -30,8 +30,8 @@ try:
 except ImportError as e:
     raise ImportError(f"PySpark not found: {e}.")
 
-from path_analyzer import PathAnalyzer
-from authentication_manager import AuthenticationManager
+from .path_analyzer import PathAnalyzer
+from .authentication_manager import AuthenticationManager
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,17 @@ class UCPassthroughFormatWriter:
         """Write the DataFrame to the given path, routing via PathAnalyzer."""
         if path is None:
             raise ValueError("Path must be specified for save().")
+
+        # Delta format requires a UC table name, not a raw abfss:// path.
+        # Spark's Delta writer needs Hadoop ABFS credentials which are deliberately
+        # absent in a passthrough setup.  Direct the caller to saveAsTable() instead.
+        if self._format_type.lower() == 'delta' and path.startswith('abfss://'):
+            raise ValueError(
+                "Delta format cannot be written to a raw abfss:// path in passthrough mode. "
+                "Hadoop ABFS credentials are not configured. "
+                "Use saveAsTable('catalog.schema.table') to persist a Delta table via "
+                "Unity Catalog governance instead."
+            )
 
         explicit_override = self._write_options.get('uc_passthrough_override')
 
@@ -231,7 +242,7 @@ class UCPassthroughFormatWriter:
         storage_account_url, container, blob_path = self._parse_adls_path(path)
         adls_client = self._auth_manager.get_adls_client(storage_account_url)
 
-        from direct_adls_writer import DirectADLSWriter
+        from .direct_adls_writer import DirectADLSWriter
         writer = DirectADLSWriter(adls_client, self._spark)
 
         fmt = self._format_type.lower()
@@ -253,6 +264,8 @@ class UCPassthroughFormatWriter:
             'orc':        lambda: writer.write_orc_files(
                               self._df, container, blob_path, mode, partition_cols, opts),
             'avro':       lambda: writer.write_avro_files(
+                              self._df, container, blob_path, mode, partition_cols, opts),
+            'xml':        lambda: writer.write_xml_files(
                               self._df, container, blob_path, mode, partition_cols, opts),
         }
 
