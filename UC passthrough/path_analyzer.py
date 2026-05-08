@@ -50,20 +50,38 @@ class PathAnalyzer:
             config: Optional configuration dictionary with custom patterns and overrides
         """
         self.config = config or {}
-        
-        # Override patterns for explicit organizational control
+
+        def _to_list(value, key: str) -> list:
+            """
+            Accept either a list or a comma-separated string.
+            Passing a raw string (e.g. from os.environ) is the most common
+            misconfiguration — split it rather than silently iterating characters.
+            Empty string and None both return [].
+            """
+            if value is None or value == '':
+                return []
+            if isinstance(value, list):
+                return [v for v in value if v]
+            if isinstance(value, str):
+                return [v.strip() for v in value.split(',') if v.strip()]
+            raise TypeError(
+                f"PathAnalyzer config['{key}'] must be a list or comma-separated string, "
+                f"got {type(value).__name__!r}"
+            )
+
+        # Override patterns for explicit organisational control
         self.force_uc_patterns = [
-            re.compile(pattern, re.IGNORECASE) 
-            for pattern in self.config.get('force_uc_patterns', [])
+            re.compile(pattern, re.IGNORECASE)
+            for pattern in _to_list(self.config.get('force_uc_patterns'), 'force_uc_patterns')
         ]
         self.force_adls_patterns = [
-            re.compile(pattern, re.IGNORECASE) 
-            for pattern in self.config.get('force_adls_patterns', [])
+            re.compile(pattern, re.IGNORECASE)
+            for pattern in _to_list(self.config.get('force_adls_patterns'), 'force_adls_patterns')
         ]
-        
+
         # Custom format mappings
-        self.custom_uc_formats = set(self.config.get('custom_uc_formats', []))
-        self.custom_adls_formats = set(self.config.get('custom_adls_formats', []))
+        self.custom_uc_formats   = set(_to_list(self.config.get('custom_uc_formats'),   'custom_uc_formats'))
+        self.custom_adls_formats = set(_to_list(self.config.get('custom_adls_formats'), 'custom_adls_formats'))
         
         # Compile UC patterns
         self.uc_volume_regex = re.compile(self.UC_VOLUME_PATTERN)
