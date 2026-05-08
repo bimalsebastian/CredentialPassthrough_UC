@@ -951,6 +951,7 @@ class DirectADLSWriter:
                               row_group_size: Optional[int]) -> None:
         """Serialise an Arrow table to a Parquet buffer and upload to ADLS."""
         import pyarrow.parquet as pq
+        arrow_table = self._sanitise_null_columns(arrow_table)
         buf = io.BytesIO()
         kwargs = {'compression': compression}
         if row_group_size:
@@ -1034,9 +1035,27 @@ class DirectADLSWriter:
             logger.error(f"Failed to write ORC files to {blob_path}: {str(e)}")
             raise RuntimeError(f"ORC file writing failed: {str(e)}")
 
+    @staticmethod
+    def _sanitise_null_columns(arrow_table):
+        """
+        Cast any pa.null() columns to pa.string() so ORC and Parquet writers
+        don't reject them.  Columns are all-None in the source DataFrame when
+        PyArrow cannot infer a concrete type.
+        """
+        import pyarrow as pa
+        new_cols = []
+        for i, field in enumerate(arrow_table.schema):
+            col = arrow_table.column(i)
+            if pa.types.is_null(field.type):
+                col = col.cast(pa.string())
+                field = field.with_type(pa.string())
+            new_cols.append(col)
+        return pa.table(dict(zip(arrow_table.schema.names, new_cols)))
+
     def _write_single_orc(self, arrow_table, file_system_client: FileSystemClient,
                           target_path: str, compression: str) -> None:
         import pyarrow.orc as orc
+        arrow_table = self._sanitise_null_columns(arrow_table)
         buf = io.BytesIO()
         orc.write_table(arrow_table, buf, compression=compression)
         file_client = file_system_client.get_file_client(target_path)
@@ -1057,7 +1076,7 @@ class DirectADLSWriter:
                 f"{col}={val}" for col, val in zip(partition_columns, partition_values)
             )
             output_df = group_df.drop(columns=partition_columns)
-            part_table = pa.Table.from_pandas(output_df)
+            part_table = self._sanitise_null_columns(pa.Table.from_pandas(output_df))
             buf = io.BytesIO()
             orc.write_table(part_table, buf, compression=compression)
             file_path = f"{target_path}/{partition_dir}/part-00000.orc"
@@ -1108,18 +1127,80 @@ class DirectADLSWriter:
             logger.error(f"Failed to write Avro files to {blob_path}: {str(e)}")
             raise RuntimeError(f"Avro file writing failed: {str(e)}")
 
+    @staticmethod
+    def _pandas_dtype_to_avro(dtype) -> list:
+        """
+        Map a pandas dtype to a fastavro-compatible Avro union type.
+        All types include 'null' so columns with missing values are handled.
+        """
+        import numpy as np
+        dtype_str = str(dtype)
+        if dtype_str.startswith('int') or dtype_str.startswith('Int'):
+            return ["null", "long"]
+        if dtype_str.startswith('float') or dtype_str.startswith('Float'):
+            return ["null", "double"]
+        if dtype_str == 'bool' or dtype_str == 'boolean':
+            return ["null", "boolean"]
+        if 'datetime' in dtype_str:
+            # Avro timestamp-millis (logical type) maps to Python datetime
+            return ["null", {"type": "long", "logicalType": "timestamp-millis"}]
+        if 'date' in dtype_str:
+            # Avro date (logical type) maps to Python date
+            return ["null", {"type": "int", "logicalType": "date"}]
+        if dtype_str == 'object' or dtype_str.startswith('string'):
+            return ["null", "string"]
+        # fallback: serialize as string
+        return ["null", "string"]
+
+    @staticmethod
+    def _prepare_avro_records(pandas_df) -> list:
+        """
+        Convert a pandas DataFrame to a list of dicts safe for fastavro.
+        - datetime.date → int (days since epoch) to match Avro date logical type
+        - pd.NaT / pd.NA → None
+        - numpy scalars → native Python scalars
+        """
+        import datetime, math
+        import numpy as np
+        EPOCH = datetime.date(1970, 1, 1)
+        records = []
+        for row in pandas_df.itertuples(index=False):
+            record = {}
+            for col, val in zip(pandas_df.columns, row):
+                if val is None or (isinstance(val, float) and math.isnan(val)):
+                    record[col] = None
+                elif hasattr(val, 'item'):          # numpy scalar → Python native
+                    record[col] = val.item()
+                elif isinstance(val, datetime.date) and not isinstance(val, datetime.datetime):
+                    record[col] = (val - EPOCH).days   # Avro date = int days since epoch
+                elif isinstance(val, datetime.datetime):
+                    record[col] = int(val.timestamp() * 1000)  # Avro timestamp-millis
+                elif str(type(val)) in ("<class 'pandas._libs.missing.NAType'>",
+                                        "<class 'pandas._libs.NaTType'>"):
+                    record[col] = None
+                else:
+                    record[col] = val
+            records.append(record)
+        return records
+
+    def _build_avro_schema(self, pandas_df) -> dict:
+        """Build a fastavro schema from a pandas DataFrame's dtypes."""
+        return {
+            "type": "record",
+            "name": "Row",
+            "fields": [
+                {"name": col, "type": self._pandas_dtype_to_avro(pandas_df[col].dtype)}
+                for col in pandas_df.columns
+            ]
+        }
+
     def _write_single_avro(self, pandas_df, file_system_client: FileSystemClient,
                            target_path: str, codec: str) -> None:
         import fastavro
-        records = pandas_df.to_dict(orient='records')
-        if not records:
-            raise RuntimeError("Cannot infer Avro schema from empty DataFrame")
-        schema = fastavro.parse_schema(
-            fastavro.schema.parse_schema(
-                {"type": "record", "name": "Row",
-                 "fields": [{"name": k, "type": ["null", "string"]} for k in pandas_df.columns]}
-            )
-        )
+        if pandas_df.empty:
+            raise RuntimeError("Cannot write empty DataFrame as Avro")
+        schema = fastavro.parse_schema(self._build_avro_schema(pandas_df))
+        records = self._prepare_avro_records(pandas_df)
         buf = io.BytesIO()
         fastavro.writer(buf, schema, records, codec=codec)
         file_client = file_system_client.get_file_client(target_path)
@@ -1138,17 +1219,108 @@ class DirectADLSWriter:
                 f"{col}={val}" for col, val in zip(partition_columns, partition_values)
             )
             output_df = group_df.drop(columns=partition_columns)
-            records = output_df.to_dict(orient='records')
-            schema = fastavro.parse_schema(
-                {"type": "record", "name": "Row",
-                 "fields": [{"name": k, "type": ["null", "string"]} for k in output_df.columns]}
-            )
+            schema = fastavro.parse_schema(self._build_avro_schema(output_df))
+            records = self._prepare_avro_records(output_df)
             buf = io.BytesIO()
             fastavro.writer(buf, schema, records, codec=codec)
             file_path = f"{target_path}/{partition_dir}/part-00000.avro"
             file_client = file_system_client.get_file_client(file_path)
             _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
             logger.debug(f"Wrote partitioned Avro: {file_path}")
+
+    @_protect_adls_method
+    def write_xml_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                        mode: str = 'error', partition_columns: List[str] = None,
+                        options: Optional[Dict] = None) -> None:
+        """
+        Write DataFrame as XML files directly to ADLS.
+
+        Uses xml.etree.ElementTree — no spark-xml jar required.
+        Options:
+          rootTag  - name of the document root element (default: 'root')
+          rowTag   - name of the element wrapping each row (default: 'row')
+          encoding - character encoding (default: 'utf-8')
+        """
+        try:
+            import xml.etree.ElementTree as ET
+
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+                    if partition_columns:
+                        self._write_partitioned_xml_files(
+                            dataframe, file_system_client, write_path,
+                            partition_columns, safe_options)
+                    else:
+                        self._write_single_xml_file(
+                            dataframe, file_system_client, write_path, safe_options)
+
+                logger.info(f"Successfully wrote XML files to {blob_path} (mode: {mode})")
+
+        except Exception as e:
+            logger.error(f"Failed to write XML files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"XML file writing failed: {str(e)}")
+
+    def _write_single_xml_file(self, dataframe: DataFrame,
+                               file_system_client: FileSystemClient,
+                               target_path: str, options: Dict) -> None:
+        """Serialise a DataFrame to a single XML file and upload to ADLS."""
+        import xml.etree.ElementTree as ET
+        root_tag = options.get('rootTag', 'root')
+        row_tag  = options.get('rowTag', 'row')
+        encoding = options.get('encoding', 'utf-8')
+        pandas_df = dataframe.toPandas()
+        root_elem = ET.Element(root_tag)
+        for _, row in pandas_df.iterrows():
+            row_elem = ET.SubElement(root_elem, row_tag)
+            for col, val in row.items():
+                child = ET.SubElement(row_elem, str(col))
+                child.text = '' if val is None else str(val)
+        xml_body = ET.tostring(root_elem, encoding='unicode', xml_declaration=False)
+        declaration = '<?xml version="1.0" encoding="' + encoding + '"?>\n'
+        content = (declaration + xml_body).encode(encoding)
+        file_client = file_system_client.get_file_client(target_path)
+        _adls_gen2_safe_upload(file_client, content, True)
+        logger.debug(f"Wrote XML file: {target_path} ({len(content)} bytes)")
+
+    def _write_partitioned_xml_files(self, dataframe: DataFrame,
+                                     file_system_client: FileSystemClient,
+                                     target_path: str, partition_columns: List[str],
+                                     options: Dict) -> None:
+        """Write partitioned XML files using Hive-style directory layout."""
+        import xml.etree.ElementTree as ET
+        root_tag = options.get('rootTag', 'root')
+        row_tag  = options.get('rowTag', 'row')
+        encoding = options.get('encoding', 'utf-8')
+        pandas_df = dataframe.toPandas()
+        grouped = pandas_df.groupby(partition_columns)
+        for partition_values, group_df in grouped:
+            if len(partition_columns) == 1:
+                partition_values = [partition_values]
+            partition_dir = '/'.join(
+                f'{col}={val}' for col, val in zip(partition_columns, partition_values)
+            )
+            output_df = group_df.drop(columns=partition_columns)
+            root_elem = ET.Element(root_tag)
+            for _, row in output_df.iterrows():
+                row_elem = ET.SubElement(root_elem, row_tag)
+                for col, val in row.items():
+                    child = ET.SubElement(row_elem, str(col))
+                    child.text = '' if val is None else str(val)
+            xml_body = ET.tostring(root_elem, encoding='unicode', xml_declaration=False)
+            declaration = '<?xml version="1.0" encoding="' + encoding + '"?>\n'
+            content = (declaration + xml_body).encode(encoding)
+            file_path = f'{target_path}/{partition_dir}/part-00000.xml'
+            file_client = file_system_client.get_file_client(file_path)
+            _adls_gen2_safe_upload(file_client, content, True)
+            logger.debug(f"Wrote partitioned XML: {file_path}")
 
     def validate_dataframe_for_format(self, dataframe: DataFrame, format_type: str) -> List[str]:
         """
@@ -1227,7 +1399,7 @@ class DirectADLSWriter:
 
     def get_supported_write_operations(self) -> List[str]:
         """Return the list of supported write format operations."""
-        return ['csv', 'json', 'text', 'binaryfile', 'parquet', 'orc', 'avro']
+        return ['csv', 'json', 'text', 'binaryfile', 'parquet', 'orc', 'avro', 'xml']
 
     def get_supported_write_modes(self) -> List[str]:
         """Return the list of supported write modes."""
