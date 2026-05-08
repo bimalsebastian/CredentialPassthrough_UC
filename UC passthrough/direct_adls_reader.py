@@ -1,721 +1,1516 @@
 """
-Direct ADLS File Reader with DataFrame Conversion
+Secured Direct ADLS File Writer with Transaction Safety
 
-This module reads unstructured files directly from ADLS using Python SDK with user credentials,
-then converts the data to Spark DataFrames without requiring Spark-level token injection.
+This module writes data directly to ADLS using Python SDK with user credentials,
+converting Spark DataFrames to various file formats without requiring Spark-level token injection.
+
+All authentication mechanisms and sensitive operations are protected from user manipulation.
+Implements transaction-like behavior for write safety and rollback capabilities.
+
+UPDATED: Fixed ADLS Gen2 x-ms-blob-type header issue by using proper Data Lake API sequence.
+UPDATED: Modified to preserve original filenames instead of generating new ones.
 """
 
 import io
 import json
 import logging
-from typing import Optional, Dict, Any, List, Union, Iterator
+from typing import Optional, Dict, Any, List, Union, Tuple
 from urllib.parse import urlparse
 from datetime import datetime
-import glob
+import uuid
 import os
+import threading
+from functools import wraps
+from contextlib import contextmanager
 
 try:
     from pyspark.sql import DataFrame, SparkSession
-    from pyspark.sql.types import StructType, StructField, StringType, BinaryType, LongType, TimestampType, IntegerType
+    from pyspark.sql.types import StructType, StructField, StringType, BinaryType
     from pyspark.sql.functions import col, lit
     import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 except ImportError as e:
     raise ImportError(f"Required libraries not found: {e}")
 
 try:
     from azure.storage.filedatalake import DataLakeServiceClient, FileSystemClient, DataLakeFileClient
-    from azure.core.exceptions import ResourceNotFoundError, HttpResponseError
-    import chardet  # For encoding detection
+    from azure.core.exceptions import ResourceNotFoundError, HttpResponseError, ResourceExistsError
 except ImportError as e:
     raise ImportError(f"Required Azure libraries not found: {e}")
 
 logger = logging.getLogger(__name__)
 
 
-class DirectADLSReader:
+def _protect_adls_method(method):
+    """Decorator to protect ADLS client access methods from external access."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        # Check if being called from within the same module/trusted context
+        import inspect
+        frame = inspect.currentframe().f_back
+        caller_module = frame.f_globals.get('__name__', '')
+        
+        # Get the base module name
+        base_module = __name__.split('.')[0] if '.' in __name__ else __name__
+        caller_base_module = caller_module.split('.')[0] if '.' in caller_module else caller_module
+        
+        # Allow calls from within the same package or trusted modules
+        trusted_modules = {
+            'authentication_manager',
+            'direct_adls_reader',
+            'direct_adls_writer',
+            'uc_passthrough_library',
+            'uc_passthrough_writer',   # write proxy — replaces old uc_dataframe_writer
+            '__main__'  # Allow calls from main execution context
+        }
+        
+        if (caller_base_module == base_module or 
+            caller_module in trusted_modules or
+            caller_base_module in trusted_modules):
+            return method(self, *args, **kwargs)
+        else:
+            logger.warning(f"Blocked access to protected method {method.__name__} from {caller_module}")
+            raise PermissionError("Direct access to ADLS client methods is restricted")
+        
+    return wrapper
+
+
+def _adls_gen2_safe_upload(file_client: DataLakeFileClient, data, Is_overwrite: bool = False):
     """
-    Reads unstructured files directly from ADLS using Python SDK, then converts to Spark DataFrames.
-    This bypasses the need for Spark-level credential injection.
+    Upload data to ADLS Gen2 using the correct Data Lake API sequence.
+    
+    Args:
+        file_client: DataLakeFileClient instance
+        data: Data to upload (bytes or string)
+        overwrite: Whether to overwrite existing files
+    """
+    try:
+        # Convert string to bytes if needed
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        
+        # # Step 1: Handle existing file if overwrite is requested
+        # if overwrite:
+        #     try:
+        #         file_client.delete_file()
+        #         logger.debug("Deleted existing file for overwrite")
+        #     except Exception:
+        #         pass  # File might not exist, that's fine
+        
+        # # Step 2: Create the file using Data Lake API (this sets correct headers internally)
+        # file_client.create_file()
+        # logger.debug("Created file using Data Lake API")
+        
+        # Step 3: Upload data if there is any
+        if data and len(data) > 0:
+            # Append the data
+            # print(f"Uploading {len(data)} bytes of data...as {file_client.url} with overwrite: {Is_overwrite}")
+            file_client.upload_data(data, overwrite=Is_overwrite)
+            logger.debug(f"Appended {len(data)} bytes of data")
+            
+            # Flush/commit the data (this is crucial!)
+            file_client.flush_data(len(data))
+            logger.debug("Flushed data to finalize upload")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"ADLS Gen2 safe upload failed: {str(e)}")
+        raise
+
+
+class WriteTransactionContext:
+    """
+    Context manager for transaction-safe writes to ADLS.
+    Provides rollback capabilities for failed write operations.
+    """
+    
+    def __init__(self, file_system_client: FileSystemClient, target_path: str, 
+                 write_mode: str, adls_client_account_name: str):
+        """
+        Initialize transaction context.
+        
+        Args:
+            file_system_client: ADLS file system client
+            target_path: Final target path for the data
+            write_mode: Write mode ('overwrite', 'append', 'ignore', 'error')
+            adls_client_account_name: ADLS account name for path construction
+        """
+        self.file_system_client = file_system_client
+        self.target_path = target_path.rstrip('/')
+        self.write_mode = write_mode
+        self.account_name = adls_client_account_name
+        
+        # Generate unique transaction ID
+        self.transaction_id = str(uuid.uuid4())[:8]
+        self.temp_path = f"{self.target_path}_temp_{self.transaction_id}"
+        self.backup_path = None
+        
+        self.committed = False
+        self.files_written = []  # Track files for cleanup
+        
+        logger.debug(f"Created transaction context: {self.transaction_id}")
+    
+    def __enter__(self):
+        """Enter transaction context."""
+        try:
+            # Handle different write modes
+            if self.write_mode == 'error':
+                # Check if target already exists
+                if self._path_exists(self.target_path):
+                    raise FileExistsError(f"Target path already exists and mode is 'error': {self.target_path}")
+            
+            elif self.write_mode == 'ignore':
+                # Check if target already exists
+                if self._path_exists(self.target_path):
+                    logger.info(f"Target path exists and mode is 'ignore', skipping write: {self.target_path}")
+                    self.committed = True  # Mark as committed to skip actual write
+                    return self
+            
+            elif self.write_mode == 'overwrite':
+                # Create backup if target exists
+                if self._path_exists(self.target_path):
+                    self.backup_path = f"{self.target_path}_backup_{self.transaction_id}"
+                    self._move_path(self.target_path, self.backup_path)
+                    logger.debug(f"Created backup: {self.backup_path}")
+            
+            elif self.write_mode == 'append':
+                # For append mode, validate target exists and is compatible
+                if self._path_exists(self.target_path):
+                    logger.debug(f"Appending to existing path: {self.target_path}")
+                else:
+                    logger.debug(f"Target does not exist, creating new: {self.target_path}")
+            
+            return self
+            
+        except Exception as e:
+            logger.error(f"Failed to enter transaction context: {str(e)}")
+            raise
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit transaction context with rollback on failure."""
+        try:
+            if exc_type is None and not self.committed:
+                # Success case - commit transaction
+                self._commit_transaction()
+            elif exc_type is not None:
+                # Failure case - rollback transaction
+                self._rollback_transaction()
+            
+        except Exception as rollback_error:
+            logger.error(f"Error during transaction cleanup: {str(rollback_error)}")
+        
+        return False  # Don't suppress any exceptions
+    
+    def _commit_transaction(self):
+        """Commit the transaction by moving temp files to target."""
+        try:
+            if self.write_mode == 'ignore' and self._path_exists(self.target_path):
+                # Nothing to commit for ignore mode when target exists
+                self.committed = True
+                return
+            
+            # Move temp files to target location
+            if self._path_exists(self.temp_path):
+                if self.write_mode == 'append' and self._path_exists(self.target_path):
+                    # For append mode, merge the files
+                    self._merge_paths(self.temp_path, self.target_path)
+                else:
+                    # For other modes, replace target with temp
+                    self._move_path(self.temp_path, self.target_path)
+            
+            # Clean up backup if successful
+            if self.backup_path and self._path_exists(self.backup_path):
+                self._delete_path(self.backup_path)
+                logger.debug(f"Deleted backup: {self.backup_path}")
+            
+            self.committed = True
+            logger.debug(f"Transaction committed: {self.transaction_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to commit transaction {self.transaction_id}: {str(e)}")
+            raise
+    
+    def _rollback_transaction(self):
+        """Rollback the transaction by restoring from backup."""
+        try:
+            # Delete temp files
+            if self._path_exists(self.temp_path):
+                self._delete_path(self.temp_path)
+                logger.debug(f"Deleted temp path: {self.temp_path}")
+            
+            # Restore from backup if needed
+            if self.backup_path and self._path_exists(self.backup_path):
+                self._move_path(self.backup_path, self.target_path)
+                logger.debug(f"Restored from backup: {self.backup_path}")
+            
+            logger.info(f"Transaction rolled back: {self.transaction_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to rollback transaction {self.transaction_id}: {str(e)}")
+            raise
+    
+    def _path_exists(self, path: str) -> bool:
+        """Check if a path exists in ADLS."""
+        try:
+            # Try to get path properties - more reliable than get_paths
+            paths = list(self.file_system_client.get_paths(path=path, max_results=1))
+            return len(paths) > 0
+        except ResourceNotFoundError:
+            return False
+        except Exception as e:
+            logger.debug(f"Error checking path existence {path}: {str(e)}")
+            return False
+    
+    def _move_path(self, source_path: str, dest_path: str):
+        """Move a path from source to destination."""
+        try:
+            # List all files in source path
+            source_paths = list(self.file_system_client.get_paths(path=source_path, recursive=True))
+            
+            for source_file in source_paths:
+                if not source_file.is_directory:
+                    # Calculate relative path
+                    relative_path = source_file.name[len(source_path):].lstrip('/')
+                    dest_file_path = f"{dest_path}/{relative_path}" if relative_path else dest_path
+                    
+                    # Get source file client
+                    source_client = self.file_system_client.get_file_client(source_file.name)
+                    dest_client = self.file_system_client.get_file_client(dest_file_path)
+                    
+                    # Copy data using safe upload method
+                    download = source_client.download_file()
+                    data = download.readall()
+                    _adls_gen2_safe_upload(dest_client, data, True)
+            
+            # Delete source after successful copy
+            self._delete_path(source_path)
+            
+        except Exception as e:
+            logger.error(f"Failed to move path {source_path} to {dest_path}: {str(e)}")
+            raise
+    
+    def _merge_paths(self, source_path: str, dest_path: str):
+        """Merge source path into destination path (for append mode)."""
+        try:
+            # List all files in source path
+            source_paths = list(self.file_system_client.get_paths(path=source_path, recursive=True))
+            
+            for source_file in source_paths:
+                if not source_file.is_directory:
+                    # Extract original filename from source
+                    original_filename = source_file.name.split('/')[-1]
+                    
+                    # For append mode, preserve original filename but ensure uniqueness
+                    dest_file_path = f"{dest_path}/{original_filename}"
+                    
+                    # Check if file already exists and make unique if needed
+                    counter = 1
+                    base_name, ext = os.path.splitext(original_filename)
+                    while self._file_exists(dest_file_path):
+                        dest_file_path = f"{dest_path}/{base_name}_{counter}{ext}"
+                        counter += 1
+                    
+                    # Copy file to destination using safe upload method
+                    source_client = self.file_system_client.get_file_client(source_file.name)
+                    dest_client = self.file_system_client.get_file_client(dest_file_path)
+                    
+                    download = source_client.download_file()
+                    data = download.readall()
+                    _adls_gen2_safe_upload(dest_client, data, True)
+            
+            # Delete source after successful merge
+            self._delete_path(source_path)
+            
+        except Exception as e:
+            logger.error(f"Failed to merge path {source_path} into {dest_path}: {str(e)}")
+            raise
+    
+    def _file_exists(self, file_path: str) -> bool:
+        """Check if a specific file exists."""
+        try:
+            file_client = self.file_system_client.get_file_client(file_path)
+            file_client.get_file_properties()
+            return True
+        except ResourceNotFoundError:
+            return False
+        except Exception:
+            return False
+    
+    def _delete_path(self, path: str):
+        """Delete a path and all its contents."""
+        try:
+            # List all files in path
+            paths = list(self.file_system_client.get_paths(path=path, recursive=True))
+            
+            # Delete files first (reverse order to handle nested structures)
+            for file_path in reversed(paths):
+                if not file_path.is_directory:
+                    file_client = self.file_system_client.get_file_client(file_path.name)
+                    file_client.delete_file()
+            
+            # Delete directories
+            for dir_path in reversed(paths):
+                if dir_path.is_directory:
+                    dir_client = self.file_system_client.get_directory_client(dir_path.name)
+                    dir_client.delete_directory()
+                    
+        except Exception as e:
+            logger.warning(f"Error deleting path {path}: {str(e)}")
+    
+    def get_temp_path(self) -> str:
+        """Get the temporary path for writing."""
+        return self.temp_path
+
+
+class DirectADLSWriter:
+    """
+    Writes data directly to ADLS using Python SDK with user credentials.
+    Provides transaction safety and rollback capabilities for write operations.
+    
+    All authentication mechanisms and ADLS client access is protected from user manipulation.
+    UPDATED: Uses correct ADLS Gen2 API sequence to avoid x-ms-blob-type header issues.
+    UPDATED: Modified to preserve original filenames instead of generating new ones.
     """
     
     def __init__(self, adls_client: DataLakeServiceClient, spark_session: SparkSession):
         """
-        Initialize DirectADLSReader.
+        Initialize DirectADLSWriter with protected ADLS client.
         
         Args:
-            adls_client: Authenticated ADLS client with user credentials
-            spark_session: Active Spark session for DataFrame creation
+            adls_client: Authenticated ADLS client with user credentials (kept private)
+            spark_session: Active Spark session for DataFrame operations
         """
-        self.adls_client = adls_client
+        self.__adls_client = adls_client  # Private - protected from direct access
         self.spark = spark_session
-        self.max_files_per_read = 1000  # Safety limit
-        self.max_file_size_mb = 100  # Safety limit for individual files
+        self.__lock = threading.Lock()  # Thread safety for sensitive operations
         
-    def read_text_files(self, container: str, blob_path: str, 
-                       encoding: Optional[str] = None,
-                       options: Optional[Dict] = None) -> DataFrame:
+        # Security limits - these are protected from modification
+        self.__max_files_per_write = 1000  # Safety limit
+        self.__max_partition_files = 100  # Safety limit per partition
+        self.__max_file_size_mb = 500  # Safety limit for individual files
+        
+        logger.debug("DirectADLSWriter initialized with protected ADLS client and ADLS Gen2 fix")
+    
+    @_protect_adls_method
+    def write_text_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                        mode: str = 'error', partition_columns: List[str] = None,
+                        options: Optional[Dict] = None) -> None:
         """
-        Read text files directly from ADLS and convert to Spark DataFrame.
+        Protected method to write text files directly to ADLS.
+        This method is protected from direct user access.
         
         Args:
+            dataframe: DataFrame to write
             container: ADLS container name
-            blob_path: Path to file(s) - supports wildcards
-            encoding: File encoding (auto-detected if None)
-            options: Additional reading options
-            
-        Returns:
-            Spark DataFrame with text content
+            blob_path: Target path for files
+            mode: Write mode ('overwrite', 'append', 'ignore', 'error')
+            partition_columns: Optional partition columns
+            options: Additional writing options
         """
         try:
-            files_data = []
-            file_system_client = self.adls_client.get_file_system_client(container)
-            
-            # Get list of files matching the pattern
-            file_paths = self._resolve_file_paths(file_system_client, blob_path)
-            
-            if len(file_paths) > self.max_files_per_read:
-                logger.warning(f"Found {len(file_paths)} files, limiting to {self.max_files_per_read}")
-                file_paths = file_paths[:self.max_files_per_read]
-            
-            for file_path in file_paths:
-                try:
-                    file_client = file_system_client.get_file_client(file_path)
-                    
-                    # Get file properties
-                    properties = file_client.get_file_properties()
-                    file_size_mb = properties.size / (1024 * 1024)
-                    
-                    if file_size_mb > self.max_file_size_mb:
-                        logger.warning(f"Skipping large file {file_path} ({file_size_mb:.1f} MB)")
-                        continue
-                    
-                    # Download file content
-                    download = file_client.download_file()
-                    content_bytes = download.readall()
-                    
-                    # Detect encoding if not specified
-                    if encoding is None:
-                        detected = chardet.detect(content_bytes)
-                        file_encoding = detected.get('encoding', 'utf-8')
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
+                encoding = safe_options.get('encoding', 'utf-8')
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+                    if partition_columns:
+                        self._write_partitioned_text_files(
+                            dataframe, file_system_client, write_path,
+                            partition_columns, encoding, safe_options)
                     else:
-                        file_encoding = encoding
-                    
-                    # Decode content
-                    content_text = content_bytes.decode(file_encoding)
-                    
-                    # Create file record
-                    file_record = {
-                        'path': f"abfss://{container}@{self.adls_client.account_name}.dfs.core.windows.net/{file_path}",
-                        'modificationTime': properties.last_modified,
-                        'length': properties.size,
-                        'content': content_text,
-                        'encoding': file_encoding
-                    }
-                    files_data.append(file_record)
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to read file {file_path}: {str(e)}")
-                    continue
-            
-            if not files_data:
-                raise RuntimeError(f"No files could be read from {blob_path}")
-            
-            # Convert to Spark DataFrame
-            return self._create_text_dataframe(files_data)
-            
+                        self._write_single_text_file(
+                            dataframe, file_system_client, write_path, encoding, safe_options)
+
+                logger.info(f"Successfully wrote text files to {blob_path} (mode: {mode})")
+
         except Exception as e:
-            logger.error(f"Failed to read text files from {blob_path}: {str(e)}")
-            raise RuntimeError(f"Text file reading failed: {str(e)}")
+            logger.error(f"Failed to write text files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"Text file writing failed: {str(e)}")
+
     
-    def read_binary_files(self, container: str, blob_path: str,
-                         options: Optional[Dict] = None) -> DataFrame:
+    @_protect_adls_method
+    def write_json_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                        mode: str = 'error', partition_columns: List[str] = None,
+                        options: Optional[Dict] = None) -> None:
         """
-        Read binary files directly from ADLS and convert to Spark DataFrame.
-        
+        Protected method to write JSON files directly to ADLS.
+        This method is protected from direct user access.
+
         Args:
-            container: ADLS container name  
-            blob_path: Path to file(s) - supports wildcards
-            options: Additional reading options
-            
-        Returns:
-            Spark DataFrame with binary content (similar to Spark's binaryFile format)
-        """
-        try:
-            files_data = []
-            file_system_client = self.adls_client.get_file_system_client(container)
-            
-            # Get list of files matching the pattern
-            file_paths = self._resolve_file_paths(file_system_client, blob_path)
-            
-            if len(file_paths) > self.max_files_per_read:
-                logger.warning(f"Found {len(file_paths)} files, limiting to {self.max_files_per_read}")
-                file_paths = file_paths[:self.max_files_per_read]
-            
-            for file_path in file_paths:
-                try:
-                    file_client = file_system_client.get_file_client(file_path)
-                    
-                    # Get file properties
-                    properties = file_client.get_file_properties()
-                    file_size_mb = properties.size / (1024 * 1024)
-                    
-                    if file_size_mb > self.max_file_size_mb:
-                        logger.warning(f"Skipping large file {file_path} ({file_size_mb:.1f} MB)")
-                        continue
-                    
-                    # Download file content
-                    download = file_client.download_file()
-                    content_bytes = download.readall()
-                    
-                    # Create file record (similar to Spark's binaryFile format)
-                    file_record = {
-                        'path': f"abfss://{container}@{self.adls_client.account_name}.dfs.core.windows.net/{file_path}",
-                        'modificationTime': properties.last_modified,
-                        'length': properties.size,
-                        'content': content_bytes
-                    }
-                    files_data.append(file_record)
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to read file {file_path}: {str(e)}")
-                    continue
-            
-            if not files_data:
-                raise RuntimeError(f"No files could be read from {blob_path}")
-            
-            # Convert to Spark DataFrame
-            return self._create_binary_dataframe(files_data)
-            
-        except Exception as e:
-            logger.error(f"Failed to read binary files from {blob_path}: {str(e)}")
-            raise RuntimeError(f"Binary file reading failed: {str(e)}")
-    
-    def read_json_files(self, container: str, blob_path: str,
-                       options: Optional[Dict] = None) -> DataFrame:
-        """
-        Read JSON files directly from ADLS and convert to Spark DataFrame.
-        
-        Args:
+            dataframe: DataFrame to write
             container: ADLS container name
-            blob_path: Path to file(s) - supports wildcards  
-            options: Additional reading options (multiLine, etc.)
-            
-        Returns:
-            Spark DataFrame with JSON data
+            blob_path: Target path for files
+            mode: Write mode ('overwrite', 'append', 'ignore', 'error')
+            partition_columns: Optional partition columns
+            options: Additional writing options
         """
         try:
-            all_json_data = []
-            file_system_client = self.adls_client.get_file_system_client(container)
-            
-            # Get list of files matching the pattern
-            file_paths = self._resolve_file_paths(file_system_client, blob_path)
-            
-            multiline = options.get('multiLine', False) if options else False
-            
-            for file_path in file_paths[:self.max_files_per_read]:
-                try:
-                    file_client = file_system_client.get_file_client(file_path)
-                    
-                    # Get file properties and check size
-                    properties = file_client.get_file_properties()
-                    file_size_mb = properties.size / (1024 * 1024)
-                    
-                    if file_size_mb > self.max_file_size_mb:
-                        logger.warning(f"Skipping large file {file_path} ({file_size_mb:.1f} MB)")
-                        continue
-                    
-                    # Download and parse JSON content
-                    download = file_client.download_file()
-                    content_bytes = download.readall()
-                    content_text = content_bytes.decode('utf-8')
-                    
-                    if multiline:
-                        # Single JSON object per file
-                        json_obj = json.loads(content_text)
-                        json_obj['_file_path'] = f"abfss://{container}@{self.adls_client.account_name}.dfs.core.windows.net/{file_path}"
-                        all_json_data.append(json_obj)
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+                    if partition_columns:
+                        self._write_partitioned_json_files(
+                            dataframe, file_system_client, write_path,
+                            partition_columns, safe_options)
                     else:
-                        # JSON Lines format (one JSON per line)
-                        for line_num, line in enumerate(content_text.strip().split('\n')):
-                            if line.strip():
-                                try:
-                                    json_obj = json.loads(line)
-                                    json_obj['_file_path'] = f"abfss://{container}@{self.adls_client.account_name}.dfs.core.windows.net/{file_path}"
-                                    json_obj['_line_number'] = line_num + 1
-                                    all_json_data.append(json_obj)
-                                except json.JSONDecodeError as e:
-                                    logger.warning(f"Invalid JSON on line {line_num + 1} in {file_path}: {str(e)}")
-                                    continue
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to read JSON file {file_path}: {str(e)}")
-                    continue
-            
-            if not all_json_data:
-                raise RuntimeError(f"No valid JSON data found in {blob_path}")
-            
-            # Convert to Pandas DataFrame first, then to Spark
-            pandas_df = pd.json_normalize(all_json_data)
-            spark_df = self.spark.createDataFrame(pandas_df)
-            
-            return spark_df
-            
+                        self._write_single_json_file(
+                            dataframe, file_system_client, write_path, safe_options)
+
+                logger.info(f"Successfully wrote JSON files to {blob_path} (mode: {mode})")
+
         except Exception as e:
-            logger.error(f"Failed to read JSON files from {blob_path}: {str(e)}")
-            raise RuntimeError(f"JSON file reading failed: {str(e)}")
-    
-    def read_csv_files(self, container: str, blob_path: str,
-                      options: Optional[Dict] = None) -> DataFrame:
+            logger.error(f"Failed to write JSON files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"JSON file writing failed: {str(e)}")
+
+    def _write_single_json_file(self, dataframe: DataFrame, file_system_client: FileSystemClient,
+                                target_path: str, options: Dict) -> None:
+        """Write DataFrame as a single JSON Lines file using ADLS Gen2 safe upload."""
+        try:
+            pandas_df = dataframe.toPandas()
+            orient = options.get('orient', 'records')
+            lines = options.get('lines', True)  # default to JSON Lines (one object per row)
+            date_format = options.get('dateFormat', 'iso')
+            null_value = options.get('nullValue', None)
+
+            buf = io.StringIO()
+            if lines:
+                pandas_df.to_json(buf, orient='records', lines=True,
+                                  date_format=date_format)
+            else:
+                pandas_df.to_json(buf, orient=orient, date_format=date_format)
+            content = buf.getvalue().encode('utf-8')
+            buf.close()
+
+            file_client = file_system_client.get_file_client(target_path)
+            _adls_gen2_safe_upload(file_client, content, True)
+            logger.debug(f"Wrote JSON file: {target_path} ({len(content)} bytes)")
+
+        except Exception as e:
+            logger.error(f"Failed to write single JSON file: {str(e)}")
+            raise
+
+    def _write_partitioned_json_files(self, dataframe: DataFrame,
+                                      file_system_client: FileSystemClient,
+                                      target_path: str, partition_columns: List[str],
+                                      options: Dict) -> None:
+        """Write DataFrame as partitioned JSON Lines files."""
+        try:
+            pandas_df = dataframe.toPandas()
+            date_format = options.get('dateFormat', 'iso')
+            grouped = pandas_df.groupby(partition_columns)
+
+            for partition_values, group_df in grouped:
+                if len(partition_columns) == 1:
+                    partition_values = [partition_values]
+                partition_dir = "/".join(
+                    f"{col}={val}" for col, val in zip(partition_columns, partition_values)
+                )
+                full_partition_path = f"{target_path}/{partition_dir}/part-00000.json"
+                output_df = group_df.drop(columns=partition_columns)
+                buf = io.StringIO()
+                output_df.to_json(buf, orient='records', lines=True, date_format=date_format)
+                content = buf.getvalue().encode('utf-8')
+                buf.close()
+                file_client = file_system_client.get_file_client(full_partition_path)
+                _adls_gen2_safe_upload(file_client, content, True)
+                logger.debug(f"Wrote partitioned JSON file: {full_partition_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to write partitioned JSON files: {str(e)}")
+            raise
+    def _filter_sensitive_options(self, options: Optional[Dict]) -> Dict:
         """
-        Read CSV files directly from ADLS and convert to Spark DataFrame.
+        Filter out sensitive authentication options that users shouldn't control directly.
         
         Args:
-            container: ADLS container name
-            blob_path: Path to file(s) - supports wildcards
-            options: CSV reading options (header, sep, etc.)
+            options: Dictionary of user-provided options (can be None)
             
         Returns:
-            Spark DataFrame with CSV data
+            Dictionary with sensitive authentication options removed
+        """
+        if not options:
+            return {}
+        
+        # Define sensitive keys that should be filtered out for security
+        sensitive_keys = {
+            'azure_storage_account_key', 
+            'azure_storage_sas_token',
+            'azure_tenant_id', 
+            'azure_client_id', 
+            'azure_client_secret',
+            'fs.azure.account.auth.type', 
+            'fs.azure.account.oauth.provider.type',
+            'fs.azure.account.oauth2.client.id', 
+            'fs.azure.account.oauth2.client.secret',
+            'fs.azure.account.oauth2.client.endpoint',
+            'fs.azure.account.oauth2.token.endpoint',
+            # Additional sensitive patterns
+            'azure_storage_connection_string',
+            'fs.azure.sas',
+            'fs.azure.account.key'
+        }
+        
+        # Filter out sensitive options (case-insensitive comparison)
+        filtered_options = {}
+        for key, value in options.items():
+            if key.lower() not in {sk.lower() for sk in sensitive_keys}:
+                filtered_options[key] = value
+            else:
+                logger.warning(f"Filtered out sensitive authentication option: {key}")
+        
+        return filtered_options
+        
+    @_protect_adls_method
+    def write_csv_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                       mode: str = 'error', partition_columns: List[str] = None,
+                       options: Optional[Dict] = None) -> None:
+        """
+        Protected method to write CSV files directly to ADLS.
+        This method is protected from direct user access.
+
+        Args:
+            dataframe: DataFrame to write
+            container: ADLS container name
+            blob_path: Target path for files
+            mode: Write mode ('overwrite', 'append', 'ignore', 'error')
+            partition_columns: Optional partition columns
+            options: Additional writing options
         """
         try:
-            all_csv_data = []
-            file_system_client = self.adls_client.get_file_system_client(container)
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+                    if partition_columns:
+                        self._write_partitioned_csv_files(
+                            dataframe, file_system_client, write_path,
+                            partition_columns, safe_options)
+                    else:
+                        self._write_single_csv_file(
+                            dataframe, file_system_client, write_path, safe_options)
+
+                logger.info(f"Successfully wrote CSV files to {blob_path} (mode: {mode})")
+
+        except Exception as e:
+            logger.error(f"Failed to write CSV files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"CSV file writing failed: {str(e)}")
+        
+    def _write_single_csv_file(self, dataframe: DataFrame, file_system_client: FileSystemClient,
+                          target_path: str, options: Dict) -> None:
+            """Write DataFrame as a single CSV file using ADLS Gen2 safe upload."""
+            try:
+                # Convert DataFrame to CSV
+                pandas_df = dataframe.toPandas()
+                
+                # Extract CSV options with defaults
+                overwrite = options.get('overwrite', True)
+                header = options.get('header', True)
+                separator = options.get('sep', ',')
+                quote_char = options.get('quote', '"')
+                escape_char = options.get('escape', '\\')
+                null_value = options.get('nullValue', '')
+                date_format = options.get('dateFormat', None)
+                timestamp_format = options.get('timestampFormat', None)
+                
+                # Create CSV string using StringIO buffer
+                csv_buffer = io.StringIO()
+                
+                # Convert to CSV with specified options
+                pandas_df.to_csv(
+                    csv_buffer, 
+                    index=False, 
+                    header=header, 
+                    sep=separator,
+                    quotechar=quote_char,
+                    escapechar=escape_char,
+                    na_rep=null_value,
+                    date_format=date_format
+                )
+                
+                csv_content = csv_buffer.getvalue().encode('utf-8')
+                csv_buffer.close()
+                
+                # Use original filename or default if not provided
+                # filename = options.get('filename', 'data.csv')
+                # file_path = f"{target_path}/{filename}"
+                file_path = target_path
+                # print(f"Writing CSV file: {file_path}")
+                
+                # Upload CSV content using safe ADLS Gen2 method
+                file_client = file_system_client.get_file_client(file_path)
+                _adls_gen2_safe_upload(file_client, csv_content, overwrite)
+               
+
+                logger.debug(f"Wrote CSV file: {file_path} ({len(csv_content)} bytes)")
+                
+            except Exception as e:
+                logger.error(f"Failed to write single CSV file: {str(e)}")
+                raise
+    def _write_partitioned_csv_files(self, dataframe: DataFrame,
+                                     file_system_client: FileSystemClient,
+                                     target_path: str, partition_columns: List[str],
+                                     options: Dict) -> None:
+        """Write DataFrame as partitioned CSV files."""
+        try:
+            pandas_df = dataframe.toPandas()
+            header = options.get('header', True)
+            separator = options.get('sep', ',')
+            quote_char = options.get('quote', '"')
+            escape_char = options.get('escape', '\\')
+            null_value = options.get('nullValue', '')
+            date_format = options.get('dateFormat', None)
+
+            grouped = pandas_df.groupby(partition_columns)
+            for partition_values, group_df in grouped:
+                if len(partition_columns) == 1:
+                    partition_values = [partition_values]
+                partition_dir = "/".join(
+                    f"{col}={val}" for col, val in zip(partition_columns, partition_values)
+                )
+                full_partition_path = f"{target_path}/{partition_dir}/part-00000.csv"
+                output_df = group_df.drop(columns=partition_columns)
+                buf = io.StringIO()
+                output_df.to_csv(buf, index=False, header=header, sep=separator,
+                                 quotechar=quote_char, escapechar=escape_char,
+                                 na_rep=null_value, date_format=date_format)
+                content = buf.getvalue().encode('utf-8')
+                buf.close()
+                file_client = file_system_client.get_file_client(full_partition_path)
+                _adls_gen2_safe_upload(file_client, content, True)
+                logger.debug(f"Wrote partitioned CSV file: {full_partition_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to write partitioned CSV files: {str(e)}")
+            raise
+
+    @_protect_adls_method
+    def write_binary_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                        mode: str = 'error', partition_columns: List[str] = None,
+                        options: Optional[Dict] = None) -> None:
+        """
+        Protected method to write binary files directly to ADLS.
+        Expected DataFrame schema: path (string), content (binary)
+        This method is protected from direct user access.
+        
+        Args:
+            dataframe: DataFrame to write (must have 'path' and 'content' columns)
+            container: ADLS container name
+            blob_path: Target path for files
+            mode: Write mode ('overwrite', 'append', 'ignore', 'error')
+            partition_columns: Optional partition columns
+            options: Additional writing options
+        """
+        try:
+            # Validate DataFrame schema for binary files
+            required_columns = ['path', 'content']
+            df_columns = set(dataframe.columns)
+            missing_columns = set(required_columns) - df_columns
             
-            # Get list of files matching the pattern
-            file_paths = self._resolve_file_paths(file_system_client, blob_path)
+            if missing_columns:
+                raise ValueError(f"DataFrame missing required columns for binary files: {missing_columns}")
             
-            # CSV options
-            csv_options = options or {}
-            header = csv_options.get('header', True)
-            separator = csv_options.get('sep', ',')
+            with self.__lock:  # Thread-safe access to ADLS client
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                
+                # Filter sensitive options
+                safe_options = self._filter_sensitive_options(options)
+                
+                # Use transaction context for safety
+                with WriteTransactionContext(file_system_client, blob_path, mode, self.__adls_client.account_name) as tx:
+                    if tx.committed:  # Skip if ignore mode and target exists
+                        return
+                    
+                    write_path = tx.get_temp_path()
+                    
+                    if partition_columns:
+                        self._write_partitioned_binary_files(dataframe, file_system_client, write_path,
+                                                        partition_columns, safe_options)
+                    else:
+                        self._write_single_binary_files(dataframe, file_system_client, write_path, safe_options)
+                
+                logger.info(f"Successfully wrote binary files to {blob_path} (mode: {mode})")
+                
+        except Exception as e:
+            logger.error(f"Failed to write binary files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"Binary file writing failed: {str(e)}")
+
+    def _write_single_binary_files(self, dataframe: DataFrame, file_system_client: FileSystemClient,
+                                target_path: str, options: Dict) -> None:
+        """Write DataFrame with binary content to individual files using ADLS Gen2 safe upload."""
+        try:
+            # Convert DataFrame to Pandas for easier binary handling
+            pandas_df = dataframe.toPandas()
             
-            for file_path in file_paths[:self.max_files_per_read]:
-                try:
+            for idx, row in pandas_df.iterrows():
+                # Extract original filename from path
+                original_path = row['path']
+                filename = original_path.split('/')[-1] if '/' in original_path else original_path
+                
+                # If filename is empty or just a path separator, create a default name
+                if not filename or filename in ['/', '\\']:
+                    filename = f"binary_file_{idx}.bin"
+                
+                # Create target file path
+                target_file_path = f"{target_path}/{filename}"
+                
+                # Upload binary content using safe method
+                file_client = file_system_client.get_file_client(target_file_path)
+                _adls_gen2_safe_upload(file_client, row['content'], True)
+                
+                logger.debug(f"Wrote binary file: {target_file_path}")
+                
+        except Exception as e:
+            logger.error(f"Failed to write binary files: {str(e)}")
+            raise
+
+    def _write_partitioned_binary_files(self, dataframe: DataFrame, file_system_client: FileSystemClient,
+                                    target_path: str, partition_columns: List[str], options: Dict) -> None:
+        """Write DataFrame with binary content as partitioned files using ADLS Gen2 safe upload."""
+        try:
+            # Convert to Pandas for partitioning
+            pandas_df = dataframe.toPandas()
+            
+            # Group by partition columns
+            grouped = pandas_df.groupby(partition_columns)
+            
+            for partition_values, group_df in grouped:
+                # Create partition directory structure
+                if len(partition_columns) == 1:
+                    partition_values = [partition_values]
+                
+                partition_path_parts = []
+                for i, col in enumerate(partition_columns):
+                    partition_path_parts.append(f"{col}={partition_values[i]}")
+                
+                partition_dir = "/".join(partition_path_parts)
+                full_partition_path = f"{target_path}/{partition_dir}"
+                
+                # Write each binary file in the partition
+                for idx, row in group_df.iterrows():
+                    # Extract original filename from path
+                    original_path = row['path']
+                    filename = original_path.split('/')[-1] if '/' in original_path else original_path
+                    
+                    # Create partition file path
+                    file_path = f"{full_partition_path}/{filename}"
+                    
+                    # Upload binary content
                     file_client = file_system_client.get_file_client(file_path)
+                    _adls_gen2_safe_upload(file_client, row['content'], True)
                     
-                    # Check file size
-                    properties = file_client.get_file_properties()
-                    file_size_mb = properties.size / (1024 * 1024)
+                    logger.debug(f"Wrote partitioned binary file: {file_path}")
                     
-                    if file_size_mb > self.max_file_size_mb:
-                        logger.warning(f"Skipping large file {file_path} ({file_size_mb:.1f} MB)")
-                        continue
-                    
-                    # Download and parse CSV content
-                    download = file_client.download_file()
-                    content_bytes = download.readall()
-                    
-                    # Read CSV using pandas
-                    csv_data = pd.read_csv(
-                        io.BytesIO(content_bytes),
-                        header=0 if header else None,
-                        sep=separator,
-                        **{k: v for k, v in csv_options.items() if k not in ['header', 'sep']}
-                    )
-                    
-                    # Add file path column
-                    csv_data['_file_path'] = f"abfss://{container}@{self.adls_client.account_name}.dfs.core.windows.net/{file_path}"
-                    
-                    all_csv_data.append(csv_data)
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to read CSV file {file_path}: {str(e)}")
-                    continue
+        except Exception as e:
+            logger.error(f"Failed to write partitioned binary files: {str(e)}")
+            raise
             
-            if not all_csv_data:
-                raise RuntimeError(f"No valid CSV data found in {blob_path}")
+    def _write_single_text_file(self, dataframe: DataFrame, file_system_client: FileSystemClient,
+                            target_path: str, encoding: str, options: Dict) -> None:
+        """Write DataFrame as a single text file using ADLS Gen2 safe upload."""
+        try:
+            # Convert DataFrame to text content
+            pandas_df = dataframe.toPandas()
             
-            # Concatenate all CSV data
-            combined_df = pd.concat(all_csv_data, ignore_index=True)
+            # Handle different text output formats
+            if 'content' in pandas_df.columns:
+                # DataFrame has a content column - use it directly
+                text_content = '\n'.join(pandas_df['content'].astype(str))
+            else:
+                # Convert entire DataFrame to text representation
+                text_content = pandas_df.to_string(index=False)
             
-            # Convert to Spark DataFrame
-            spark_df = self.spark.createDataFrame(combined_df)
+            # Create target file
+            filename = f"part-00000.txt"
+            file_path = f"{target_path}/{filename}"
             
-            return spark_df
+            file_client = file_system_client.get_file_client(file_path)
+            
+            # Upload text content using safe ADLS Gen2 method
+            _adls_gen2_safe_upload(file_client, text_content, True)
+            
+            logger.debug(f"Wrote text file: {file_path}")
             
         except Exception as e:
-            logger.error(f"Failed to read CSV files from {blob_path}: {str(e)}")
-            raise RuntimeError(f"CSV file reading failed: {str(e)}")
-    
-    def read_parquet_files(self, container: str, blob_path: str,
-                        options: Optional[Dict] = None) -> DataFrame:
-        """Read parquet files via PyArrow — no Spark ABFS driver involved."""
+            logger.error(f"Failed to write single text file: {str(e)}")
+            raise
+
+    def _write_partitioned_text_files(self, dataframe: DataFrame, file_system_client: FileSystemClient,
+                                    target_path: str, partition_columns: List[str], 
+                                    encoding: str, options: Dict) -> None:
+        """Write DataFrame as partitioned text files using ADLS Gen2 safe upload."""
         try:
+            # Convert to Pandas for partitioning
+            pandas_df = dataframe.toPandas()
+            
+            # Group by partition columns
+            grouped = pandas_df.groupby(partition_columns)
+            
+            for partition_values, group_df in grouped:
+                # Create partition directory structure
+                if len(partition_columns) == 1:
+                    partition_values = [partition_values]
+                
+                partition_path_parts = []
+                for i, col in enumerate(partition_columns):
+                    partition_path_parts.append(f"{col}={partition_values[i]}")
+                
+                partition_dir = "/".join(partition_path_parts)
+                full_partition_path = f"{target_path}/{partition_dir}"
+                
+                # Write partition data
+                if 'content' in group_df.columns:
+                    text_content = '\n'.join(group_df['content'].astype(str))
+                else:
+                    # Drop partition columns from output and convert to text
+                    output_df = group_df.drop(columns=partition_columns)
+                    text_content = output_df.to_string(index=False)
+                
+                # Create partition file
+                filename = f"part-00000.txt"
+                file_path = f"{full_partition_path}/{filename}"
+                
+                file_client = file_system_client.get_file_client(file_path)
+                _adls_gen2_safe_upload(file_client, text_content, True)
+                
+                logger.debug(f"Wrote partitioned text file: {file_path}")
+                
+        except Exception as e:
+            logger.error(f"Failed to write partitioned text files: {str(e)}")
+            raise
+    @_protect_adls_method
+    def write_parquet_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                            mode: str = 'error', partition_columns: List[str] = None,
+                            options: Optional[Dict] = None) -> None:
+        """
+        Write DataFrame as Parquet files directly to ADLS via PyArrow.
+
+        Supports all standard Parquet write options:
+          compression  - 'snappy' (default), 'gzip', 'brotli', 'zstd', 'none'
+          row_group_size - rows per row group
+        """
+        try:
+            import pyarrow as pa
             import pyarrow.parquet as pq
-            import pyarrow as pa
 
-            file_system_client = self.adls_client.get_file_system_client(container)
-            file_paths = self._resolve_file_paths(file_system_client, blob_path)
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
 
-            tables = []
-            for file_path in file_paths:
-                try:
-                    content_bytes = file_system_client.get_file_client(file_path)\
-                                        .download_file().readall()
-                    tables.append(pq.read_table(pa.BufferReader(content_bytes)))
-                except Exception as e:
-                    logger.warning(f"Failed to read parquet file {file_path}: {e}")
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
 
-            if not tables:
-                raise RuntimeError(f"No valid parquet data found in {blob_path}")
+                    compression = safe_options.get('compression', 'snappy')
+                    row_group_size = safe_options.get('row_group_size', None)
+                    pandas_df = dataframe.toPandas()
+                    arrow_table = pa.Table.from_pandas(pandas_df)
 
-            import pyarrow as pa
-            combined = pa.concat_tables(tables)
-            return self.spark.createDataFrame(combined.to_pandas())
+                    if partition_columns:
+                        self._write_partitioned_parquet(
+                            arrow_table, file_system_client, write_path,
+                            partition_columns, compression, row_group_size)
+                    else:
+                        self._write_single_parquet(
+                            arrow_table, file_system_client, write_path,
+                            compression, row_group_size)
 
-        except Exception as e:
-            logger.error(f"Failed to read parquet files from {blob_path}: {e}")
-            raise RuntimeError(f"Parquet file reading failed: {e}")
-
-
-    def read_orc_files(self, container: str, blob_path: str,
-                    options: Optional[Dict] = None) -> DataFrame:
-        """Read ORC files via PyArrow — no Spark ABFS driver involved."""
-        try:
-            import pyarrow.orc as orc
-            import io
-
-            file_system_client = self.adls_client.get_file_system_client(container)
-            file_paths = self._resolve_file_paths(file_system_client, blob_path)
-
-            all_data = []
-            for file_path in file_paths:
-                try:
-                    content_bytes = file_system_client.get_file_client(file_path)\
-                                        .download_file().readall()
-                    table = orc.read_table(io.BytesIO(content_bytes))
-                    all_data.append(table.to_pandas())
-                except Exception as e:
-                    logger.warning(f"Failed to read ORC file {file_path}: {e}")
-
-            if not all_data:
-                raise RuntimeError(f"No valid ORC data found in {blob_path}")
-
-            import pandas as pd
-            return self.spark.createDataFrame(pd.concat(all_data, ignore_index=True))
+                logger.info(f"Successfully wrote Parquet files to {blob_path} (mode: {mode})")
 
         except ImportError:
-            raise RuntimeError("PyArrow required for ORC reading: pip install pyarrow")
+            raise RuntimeError("PyArrow required for Parquet writing: pip install pyarrow")
         except Exception as e:
-            logger.error(f"Failed to read ORC files from {blob_path}: {e}")
-            raise RuntimeError(f"ORC file reading failed: {e}")
+            logger.error(f"Failed to write Parquet files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"Parquet file writing failed: {str(e)}")
 
+    def _write_single_parquet(self, arrow_table, file_system_client: FileSystemClient,
+                              target_path: str, compression: str,
+                              row_group_size: Optional[int]) -> None:
+        """Serialise an Arrow table to a Parquet buffer and upload to ADLS."""
+        import pyarrow.parquet as pq
+        arrow_table = self._sanitise_null_columns(arrow_table)
+        buf = io.BytesIO()
+        kwargs = {'compression': compression}
+        if row_group_size:
+            kwargs['row_group_size'] = row_group_size
+        pq.write_table(arrow_table, buf, **kwargs)
+        file_client = file_system_client.get_file_client(target_path)
+        _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+        logger.debug(f"Wrote Parquet file: {target_path} ({buf.tell()} bytes)")
 
-    def read_avro_files(self, container: str, blob_path: str,
-                        options: Optional[Dict] = None) -> DataFrame:
-        """Read Avro files via fastavro — no Spark ABFS driver involved."""
+    def _write_partitioned_parquet(self, arrow_table, file_system_client: FileSystemClient,
+                                   target_path: str, partition_columns: List[str],
+                                   compression: str, row_group_size: Optional[int]) -> None:
+        """Write partitioned Parquet files using Hive-style directory layout."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import pandas as pd
+
+        pandas_df = arrow_table.to_pandas()
+        grouped = pandas_df.groupby(partition_columns)
+
+        for partition_values, group_df in grouped:
+            if len(partition_columns) == 1:
+                partition_values = [partition_values]
+            partition_dir = "/".join(
+                f"{col}={val}" for col, val in zip(partition_columns, partition_values)
+            )
+            output_df = group_df.drop(columns=partition_columns)
+            part_table = pa.Table.from_pandas(output_df)
+            buf = io.BytesIO()
+            kwargs = {'compression': compression}
+            if row_group_size:
+                kwargs['row_group_size'] = row_group_size
+            pq.write_table(part_table, buf, **kwargs)
+            file_path = f"{target_path}/{partition_dir}/part-00000.parquet"
+            file_client = file_system_client.get_file_client(file_path)
+            _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+            logger.debug(f"Wrote partitioned Parquet: {file_path}")
+
+    @_protect_adls_method
+    def write_orc_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                        mode: str = 'error', partition_columns: List[str] = None,
+                        options: Optional[Dict] = None) -> None:
+        """
+        Write DataFrame as ORC files directly to ADLS via PyArrow.
+
+        Supports:
+          compression - 'zlib' (default), 'snappy', 'lz4', 'zstd', 'none'
+        """
+        try:
+            import pyarrow as pa
+            import pyarrow.orc as orc
+
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+
+                    compression = safe_options.get('compression', 'zlib')
+                    pandas_df = dataframe.toPandas()
+                    arrow_table = pa.Table.from_pandas(pandas_df)
+
+                    if partition_columns:
+                        self._write_partitioned_orc(
+                            arrow_table, file_system_client, write_path,
+                            partition_columns, compression)
+                    else:
+                        self._write_single_orc(
+                            arrow_table, file_system_client, write_path, compression)
+
+                logger.info(f"Successfully wrote ORC files to {blob_path} (mode: {mode})")
+
+        except ImportError:
+            raise RuntimeError("PyArrow required for ORC writing: pip install pyarrow")
+        except Exception as e:
+            logger.error(f"Failed to write ORC files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"ORC file writing failed: {str(e)}")
+
+    @staticmethod
+    def _sanitise_null_columns(arrow_table):
+        """
+        Cast any pa.null() columns to pa.string() so ORC and Parquet writers
+        don't reject them.  Columns are all-None in the source DataFrame when
+        PyArrow cannot infer a concrete type.
+        """
+        import pyarrow as pa
+        new_cols = []
+        for i, field in enumerate(arrow_table.schema):
+            col = arrow_table.column(i)
+            if pa.types.is_null(field.type):
+                col = col.cast(pa.string())
+                field = field.with_type(pa.string())
+            new_cols.append(col)
+        return pa.table(dict(zip(arrow_table.schema.names, new_cols)))
+
+    def _write_single_orc(self, arrow_table, file_system_client: FileSystemClient,
+                          target_path: str, compression: str) -> None:
+        import pyarrow.orc as orc
+        arrow_table = self._sanitise_null_columns(arrow_table)
+        buf = io.BytesIO()
+        orc.write_table(arrow_table, buf, compression=compression)
+        file_client = file_system_client.get_file_client(target_path)
+        _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+        logger.debug(f"Wrote ORC file: {target_path}")
+
+    def _write_partitioned_orc(self, arrow_table, file_system_client: FileSystemClient,
+                               target_path: str, partition_columns: List[str],
+                               compression: str) -> None:
+        import pyarrow as pa
+        import pyarrow.orc as orc
+        pandas_df = arrow_table.to_pandas()
+        grouped = pandas_df.groupby(partition_columns)
+        for partition_values, group_df in grouped:
+            if len(partition_columns) == 1:
+                partition_values = [partition_values]
+            partition_dir = "/".join(
+                f"{col}={val}" for col, val in zip(partition_columns, partition_values)
+            )
+            output_df = group_df.drop(columns=partition_columns)
+            part_table = self._sanitise_null_columns(pa.Table.from_pandas(output_df))
+            buf = io.BytesIO()
+            orc.write_table(part_table, buf, compression=compression)
+            file_path = f"{target_path}/{partition_dir}/part-00000.orc"
+            file_client = file_system_client.get_file_client(file_path)
+            _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+            logger.debug(f"Wrote partitioned ORC: {file_path}")
+
+    @_protect_adls_method
+    def write_avro_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                         mode: str = 'error', partition_columns: List[str] = None,
+                         options: Optional[Dict] = None) -> None:
+        """
+        Write DataFrame as Avro files directly to ADLS via fastavro.
+
+        Supports:
+          codec - 'null' (default), 'deflate', 'snappy', 'bzip2'
+        """
         try:
             import fastavro
-            import io
-            import pandas as pd
 
-            file_system_client = self.adls_client.get_file_system_client(container)
-            file_paths = self._resolve_file_paths(file_system_client, blob_path)
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
 
-            all_records = []
-            for file_path in file_paths:
-                try:
-                    content_bytes = file_system_client.get_file_client(file_path)\
-                                        .download_file().readall()
-                    records = list(fastavro.reader(io.BytesIO(content_bytes)))
-                    all_records.extend(records)
-                except Exception as e:
-                    logger.warning(f"Failed to read Avro file {file_path}: {e}")
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
 
-            if not all_records:
-                raise RuntimeError(f"No valid Avro data found in {blob_path}")
+                    codec = safe_options.get('codec', 'null')
+                    pandas_df = dataframe.toPandas()
 
-            return self.spark.createDataFrame(pd.DataFrame(all_records))
+                    if partition_columns:
+                        self._write_partitioned_avro(
+                            pandas_df, file_system_client, write_path,
+                            partition_columns, codec)
+                    else:
+                        self._write_single_avro(
+                            pandas_df, file_system_client, write_path, codec)
+
+                logger.info(f"Successfully wrote Avro files to {blob_path} (mode: {mode})")
 
         except ImportError:
-            raise RuntimeError("fastavro required for Avro reading: pip install fastavro")
+            raise RuntimeError("fastavro required for Avro writing: pip install fastavro")
         except Exception as e:
-            logger.error(f"Failed to read Avro files from {blob_path}: {e}")
-            raise RuntimeError(f"Avro file reading failed: {e}")
-    
-    def read_xml_files(self, container: str, blob_path: str,
-                    options: Optional[Dict] = None) -> DataFrame:
+            logger.error(f"Failed to write Avro files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"Avro file writing failed: {str(e)}")
+
+    @staticmethod
+    def _pandas_dtype_to_avro(dtype) -> list:
         """
-        Read XML files via xml.etree — no Spark ABFS driver involved.
-        Requires 'rowTag' option to identify the repeating element, 
-        matching Spark's spark-xml behaviour.
-        
-        Example: options={'rowTag': 'person'}
+        Map a pandas dtype to a fastavro-compatible Avro union type.
+        All types include 'null' so columns with missing values are handled.
+        """
+        import numpy as np
+        dtype_str = str(dtype)
+        if dtype_str.startswith('int') or dtype_str.startswith('Int'):
+            return ["null", "long"]
+        if dtype_str.startswith('float') or dtype_str.startswith('Float'):
+            return ["null", "double"]
+        if dtype_str == 'bool' or dtype_str == 'boolean':
+            return ["null", "boolean"]
+        if 'datetime' in dtype_str:
+            # Avro timestamp-millis (logical type) maps to Python datetime
+            return ["null", {"type": "long", "logicalType": "timestamp-millis"}]
+        if 'date' in dtype_str:
+            # Avro date (logical type) maps to Python date
+            return ["null", {"type": "int", "logicalType": "date"}]
+        if dtype_str == 'object' or dtype_str.startswith('string'):
+            return ["null", "string"]
+        # fallback: serialize as string
+        return ["null", "string"]
+
+    @staticmethod
+    def _prepare_avro_records(pandas_df) -> list:
+        """
+        Convert a pandas DataFrame to a list of dicts safe for fastavro.
+        - datetime.date → int (days since epoch) to match Avro date logical type
+        - pd.NaT / pd.NA → None
+        - numpy scalars → native Python scalars
+        """
+        import datetime, math
+        import numpy as np
+        EPOCH = datetime.date(1970, 1, 1)
+        records = []
+        for row in pandas_df.itertuples(index=False):
+            record = {}
+            for col, val in zip(pandas_df.columns, row):
+                if val is None or (isinstance(val, float) and math.isnan(val)):
+                    record[col] = None
+                elif hasattr(val, 'item'):          # numpy scalar → Python native
+                    record[col] = val.item()
+                elif isinstance(val, datetime.date) and not isinstance(val, datetime.datetime):
+                    record[col] = (val - EPOCH).days   # Avro date = int days since epoch
+                elif isinstance(val, datetime.datetime):
+                    record[col] = int(val.timestamp() * 1000)  # Avro timestamp-millis
+                elif str(type(val)) in ("<class 'pandas._libs.missing.NAType'>",
+                                        "<class 'pandas._libs.NaTType'>"):
+                    record[col] = None
+                else:
+                    record[col] = val
+            records.append(record)
+        return records
+
+    def _build_avro_schema(self, pandas_df) -> dict:
+        """Build a fastavro schema from a pandas DataFrame's dtypes."""
+        return {
+            "type": "record",
+            "name": "Row",
+            "fields": [
+                {"name": col, "type": self._pandas_dtype_to_avro(pandas_df[col].dtype)}
+                for col in pandas_df.columns
+            ]
+        }
+
+    def _write_single_avro(self, pandas_df, file_system_client: FileSystemClient,
+                           target_path: str, codec: str) -> None:
+        import fastavro
+        if pandas_df.empty:
+            raise RuntimeError("Cannot write empty DataFrame as Avro")
+        schema = fastavro.parse_schema(self._build_avro_schema(pandas_df))
+        records = self._prepare_avro_records(pandas_df)
+        buf = io.BytesIO()
+        fastavro.writer(buf, schema, records, codec=codec)
+        file_client = file_system_client.get_file_client(target_path)
+        _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+        logger.debug(f"Wrote Avro file: {target_path}")
+
+    def _write_partitioned_avro(self, pandas_df, file_system_client: FileSystemClient,
+                                target_path: str, partition_columns: List[str],
+                                codec: str) -> None:
+        import fastavro
+        grouped = pandas_df.groupby(partition_columns)
+        for partition_values, group_df in grouped:
+            if len(partition_columns) == 1:
+                partition_values = [partition_values]
+            partition_dir = "/".join(
+                f"{col}={val}" for col, val in zip(partition_columns, partition_values)
+            )
+            output_df = group_df.drop(columns=partition_columns)
+            schema = fastavro.parse_schema(self._build_avro_schema(output_df))
+            records = self._prepare_avro_records(output_df)
+            buf = io.BytesIO()
+            fastavro.writer(buf, schema, records, codec=codec)
+            file_path = f"{target_path}/{partition_dir}/part-00000.avro"
+            file_client = file_system_client.get_file_client(file_path)
+            _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+            logger.debug(f"Wrote partitioned Avro: {file_path}")
+
+    @_protect_adls_method
+    def write_xml_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                        mode: str = 'error', partition_columns: List[str] = None,
+                        options: Optional[Dict] = None) -> None:
+        """
+        Write DataFrame as XML files directly to ADLS.
+
+        Uses xml.etree.ElementTree — no spark-xml jar required.
+        Options:
+          rootTag  - name of the document root element (default: 'root')
+          rowTag   - name of the element wrapping each row (default: 'row')
+          encoding - character encoding (default: 'utf-8')
         """
         try:
             import xml.etree.ElementTree as ET
-            import pandas as pd
 
-            options = options or {}
-            row_tag = options.get('rowTag') or options.get('rowtag')
-            if not row_tag:
-                raise ValueError(
-                    "XML reading requires 'rowTag' option specifying the repeating element. "
-                    "Example: .option('rowTag', 'person')"
-                )
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
 
-            file_system_client = self.adls_client.get_file_system_client(container)
-            file_paths = self._resolve_file_paths(file_system_client, blob_path)
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+                    if partition_columns:
+                        self._write_partitioned_xml_files(
+                            dataframe, file_system_client, write_path,
+                            partition_columns, safe_options)
+                    else:
+                        self._write_single_xml_file(
+                            dataframe, file_system_client, write_path, safe_options)
 
-            all_records = []
-            for file_path in file_paths:
-                try:
-                    content_bytes = file_system_client.get_file_client(file_path)\
-                                        .download_file().readall()
-                    root = ET.fromstring(content_bytes.decode('utf-8'))
-
-                    # Find all elements matching rowTag anywhere in the tree
-                    elements = root.findall(f'.//{row_tag}')
-                    if not elements:
-                        # Maybe root itself is the row tag
-                        if root.tag == row_tag:
-                            elements = [root]
-
-                    for elem in elements:
-                        record = {}
-                        # Attributes become columns
-                        record.update(elem.attrib)
-                        # Child elements become columns
-                        for child in elem:
-                            # Handle nested elements by flattening one level
-                            if len(child) == 0:
-                                record[child.tag] = child.text
-                            else:
-                                record[child.tag] = ET.tostring(child, encoding='unicode')
-                        all_records.append(record)
-
-                except Exception as e:
-                    logger.warning(f"Failed to read XML file {file_path}: {e}")
-
-            if not all_records:
-                raise RuntimeError(f"No valid XML records found in {blob_path} "
-                                f"with rowTag='{row_tag}'")
-
-            return self.spark.createDataFrame(pd.DataFrame(all_records))
+                logger.info(f"Successfully wrote XML files to {blob_path} (mode: {mode})")
 
         except Exception as e:
-            logger.error(f"Failed to read XML files from {blob_path}: {e}")
-            raise RuntimeError(f"XML file reading failed: {e}")
+            logger.error(f"Failed to write XML files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"XML file writing failed: {str(e)}")
 
+    def _write_single_xml_file(self, dataframe: DataFrame,
+                               file_system_client: FileSystemClient,
+                               target_path: str, options: Dict) -> None:
+        """Serialise a DataFrame to a single XML file and upload to ADLS."""
+        import xml.etree.ElementTree as ET
+        root_tag = options.get('rootTag', 'root')
+        row_tag  = options.get('rowTag', 'row')
+        encoding = options.get('encoding', 'utf-8')
+        pandas_df = dataframe.toPandas()
+        root_elem = ET.Element(root_tag)
+        for _, row in pandas_df.iterrows():
+            row_elem = ET.SubElement(root_elem, row_tag)
+            for col, val in row.items():
+                child = ET.SubElement(row_elem, str(col))
+                child.text = '' if val is None else str(val)
+        xml_body = ET.tostring(root_elem, encoding='unicode', xml_declaration=False)
+        declaration = '<?xml version="1.0" encoding="' + encoding + '"?>\n'
+        content = (declaration + xml_body).encode(encoding)
+        file_client = file_system_client.get_file_client(target_path)
+        _adls_gen2_safe_upload(file_client, content, True)
+        logger.debug(f"Wrote XML file: {target_path} ({len(content)} bytes)")
 
-    def read_binary_files(self, container: str, blob_path: str,
-                        options: Optional[Dict] = None) -> DataFrame:
+    def _write_partitioned_xml_files(self, dataframe: DataFrame,
+                                     file_system_client: FileSystemClient,
+                                     target_path: str, partition_columns: List[str],
+                                     options: Dict) -> None:
+        """Write partitioned XML files using Hive-style directory layout."""
+        import xml.etree.ElementTree as ET
+        root_tag = options.get('rootTag', 'root')
+        row_tag  = options.get('rowTag', 'row')
+        encoding = options.get('encoding', 'utf-8')
+        pandas_df = dataframe.toPandas()
+        grouped = pandas_df.groupby(partition_columns)
+        for partition_values, group_df in grouped:
+            if len(partition_columns) == 1:
+                partition_values = [partition_values]
+            partition_dir = '/'.join(
+                f'{col}={val}' for col, val in zip(partition_columns, partition_values)
+            )
+            output_df = group_df.drop(columns=partition_columns)
+            root_elem = ET.Element(root_tag)
+            for _, row in output_df.iterrows():
+                row_elem = ET.SubElement(root_elem, row_tag)
+                for col, val in row.items():
+                    child = ET.SubElement(row_elem, str(col))
+                    child.text = '' if val is None else str(val)
+            xml_body = ET.tostring(root_elem, encoding='unicode', xml_declaration=False)
+            declaration = '<?xml version="1.0" encoding="' + encoding + '"?>\n'
+            content = (declaration + xml_body).encode(encoding)
+            file_path = f'{target_path}/{partition_dir}/part-00000.xml'
+            file_client = file_system_client.get_file_client(file_path)
+            _adls_gen2_safe_upload(file_client, content, True)
+            logger.debug(f"Wrote partitioned XML: {file_path}")
+
+    def validate_dataframe_for_format(self, dataframe: DataFrame, format_type: str) -> List[str]:
         """
-        Read binary files and return a DataFrame matching Spark's binaryFile schema:
-            path, modificationTime, length, content (bytes)
+        Validate DataFrame schema compatibility with target format.
+
+        Args:
+            dataframe: DataFrame to validate
+            format_type: Target format ('csv', 'json', 'text', 'binaryfile')
+
+        Returns:
+            List of validation warnings/errors
         """
-        try:
-            from pyspark.sql.types import (StructType, StructField, StringType,
-                                        BinaryType, LongType, TimestampType)
-
-            file_system_client = self.adls_client.get_file_system_client(container)
-            file_paths = self._resolve_file_paths(file_system_client, blob_path)
-
-            if len(file_paths) > self.max_files_per_read:
-                logger.warning(f"Found {len(file_paths)} files, "
-                            f"limiting to {self.max_files_per_read}")
-                file_paths = file_paths[:self.max_files_per_read]
-
-            files_data = []
-            for file_path in file_paths:
-                try:
-                    file_client = file_system_client.get_file_client(file_path)
-                    properties = file_client.get_file_properties()
-
-                    file_size_mb = properties.size / (1024 * 1024)
-                    if file_size_mb > self.max_file_size_mb:
-                        logger.warning(f"Skipping large file {file_path} "
-                                    f"({file_size_mb:.1f} MB)")
-                        continue
-
-                    content_bytes = file_client.download_file().readall()
-
-                    files_data.append({
-                        'path': (f"abfss://{container}@"
-                                f"{self.adls_client.account_name}"
-                                f".dfs.core.windows.net/{file_path}"),
-                        'modificationTime': properties.last_modified,
-                        'length': properties.size,
-                        'content': bytearray(content_bytes)   # bytearray for Spark BinaryType
-                    })
-
-                except Exception as e:
-                    logger.warning(f"Failed to read binary file {file_path}: {e}")
-
-            if not files_data:
-                raise RuntimeError(f"No binary files could be read from {blob_path}")
-
-            schema = StructType([
-                StructField("path",             StringType(),    False),
-                StructField("modificationTime", TimestampType(), True),
-                StructField("length",           LongType(),      True),
-                StructField("content",          BinaryType(),    True),
-            ])
-
-            return self.spark.createDataFrame(files_data, schema)
-
-        except Exception as e:
-            logger.error(f"Failed to read binary files from {blob_path}: {e}")
-            raise RuntimeError(f"Binary file reading failed: {e}")
-    
-    def _resolve_file_paths(self, file_system_client: FileSystemClient, blob_path: str) -> List[str]:
-        try:
-            if '*' in blob_path or '?' in blob_path:
-                return self._resolve_wildcard_paths(file_system_client, blob_path)
+        warnings = []
+        df_columns = set(dataframe.columns)
+        
+        if format_type.lower() == 'binaryfile':
+            required_columns = {'path', 'content'}
+            missing = required_columns - df_columns
+            if missing:
+                warnings.append(f"Binary format requires columns: {missing}")
             
-            # If path has a file extension — treat as file directly, skip metadata check
-            filename = blob_path.split('/')[-1]
-            if '.' in filename:
-                return [blob_path]
-            
-            # No extension — could be a directory, check via get_paths
+            # Check if content column is actually binary type
             try:
-                paths = list(file_system_client.get_paths(path=blob_path, max_results=1))
-                if paths:
-                    # It's a directory — list all files inside
-                    return self._list_directory_files(file_system_client, blob_path)
-                else:
-                    # Empty directory or single file with no extension
-                    return [blob_path]
-            except Exception:
-                return [blob_path]
+                content_type = dict(dataframe.dtypes)['content']
+                if content_type != 'binary':
+                    warnings.append(f"Content column should be binary type, got: {content_type}")
+            except KeyError:
+                pass
+        
+        elif format_type.lower() == 'text':
+            # For text format, either need 'content' column or will convert entire DF
+            if 'content' not in df_columns:
+                warnings.append("Text format: no 'content' column found, will convert entire DataFrame")
+        
+        # Check for problematic column names
+        problematic_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
+        for col in df_columns:
+            if any(char in col for char in problematic_chars):
+                warnings.append(f"Column '{col}' contains characters that may cause issues in file systems")
+        
+        return warnings
 
-        except Exception as e:
-            logger.error(f"Failed to resolve file paths for {blob_path}: {str(e)}")
-            raise RuntimeError(f"Path resolution failed: {str(e)}")
-    
-    def _resolve_wildcard_paths(self, file_system_client: FileSystemClient, pattern: str) -> List[str]:
+    def estimate_write_size(self, dataframe: DataFrame) -> Dict[str, Any]:
         """
-        Resolve wildcard patterns to actual file paths.
+        Estimate the size and complexity of the write operation.
         
         Args:
-            file_system_client: ADLS file system client
-            pattern: Path pattern with wildcards
+            dataframe: DataFrame to analyze
             
         Returns:
-            List of matching file paths
+            Dictionary with size estimates
         """
         try:
-            # Extract directory part and filename pattern
-            pattern_parts = pattern.split('/')
-            base_path = '/'.join(pattern_parts[:-1]) if len(pattern_parts) > 1 else ""
-            filename_pattern = pattern_parts[-1]
+            row_count = dataframe.count()
+            column_count = len(dataframe.columns)
             
-            # List files in the base directory
-            paths = file_system_client.get_paths(path=base_path, recursive=False)
+            # Estimate size based on DataFrame characteristics
+            estimated_mb = (row_count * column_count * 50) / (1024 * 1024)  # Rough estimate
             
-            matching_files = []
-            for path in paths:
-                if not path.is_directory:
-                    filename = path.name.split('/')[-1]
+            return {
+                'row_count': row_count,
+                'column_count': column_count,
+                'estimated_size_mb': estimated_mb,
+                'exceeds_single_file_limit': estimated_mb > self.__max_file_size_mb,
+                'exceeds_safety_limits': row_count > 1000000,  # 1M row safety limit
+                'recommended_partitions': max(1, int(estimated_mb / 100))  # 100MB per partition
+            }
+            
+        except Exception as e:
+            return {
+                'error': f"Failed to estimate write size: {str(e)}",
+                'row_count': -1,
+                'column_count': len(dataframe.columns),
+                'estimated_size_mb': -1
+            }
+
+    def get_supported_write_operations(self) -> List[str]:
+        """Return the list of supported write format operations."""
+        return ['csv', 'json', 'text', 'binaryfile', 'parquet', 'orc', 'avro', 'xml']
+
+    def get_supported_write_modes(self) -> List[str]:
+        """Return the list of supported write modes."""
+        return ['overwrite', 'append', 'ignore', 'error']
+
+    def get_write_statistics(self) -> Dict[str, Any]:
+        """
+        Get statistics about write operations performed by this writer instance.
+        """
+        return {
+            'operations_supported': self.get_supported_write_operations(),
+            'modes_supported': self.get_supported_write_modes(),
+            'max_files_per_write': self.__max_files_per_write,
+            'max_file_size_mb': self.__max_file_size_mb,
+            'adls_gen2_safe_upload': True,
+            'transaction_safety': True
+        }
+
+    def cleanup_failed_writes(self, container: str, pattern: str = "*_temp_*") -> Dict[str, Any]:
+        """
+        Clean up temporary files from failed write operations.
+        
+        Args:
+            container: ADLS container to clean
+            pattern: Pattern to match temporary files
+            
+        Returns:
+            Dictionary with cleanup results
+        """
+        try:
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                
+                # Find temporary files
+                temp_files = []
+                paths = file_system_client.get_paths(recursive=True)
+                
+                for path in paths:
+                    if not path.is_directory and pattern.replace("*", "") in path.name:
+                        temp_files.append(path.name)
+                
+                # Delete temporary files
+                deleted_count = 0
+                for temp_file in temp_files:
+                    try:
+                        file_client = file_system_client.get_file_client(temp_file)
+                        file_client.delete_file()
+                        deleted_count += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to delete temp file {temp_file}: {str(e)}")
+                
+                return {
+                    'success': True,
+                    'temp_files_found': len(temp_files),
+                    'temp_files_deleted': deleted_count,
+                    'container': container
+                }
+                
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'container': container
+            }
+
+    # Enhanced error handling wrapper
+    def _safe_write_operation(operation_name: str):
+        """
+        Decorator for safe write operations with comprehensive error handling.
+        """
+        def decorator(method):
+            @wraps(method)
+            def wrapper(self, *args, **kwargs):
+                start_time = datetime.now()
+                operation_id = str(uuid.uuid4())[:8]
+                
+                logger.info(f"Starting {operation_name} operation: {operation_id}")
+                
+                try:
+                    # Pre-operation validation
+                    if len(args) > 0 and hasattr(args[0], 'count'):  # DataFrame check
+                        df = args[0]
+                        size_info = self.estimate_write_size(df)
+                        if size_info.get('exceeds_safety_limits'):
+                            logger.warning(f"Write operation {operation_id} exceeds safety limits: {size_info}")
                     
-                    # Simple wildcard matching (could be enhanced with fnmatch)
-                    if self._matches_pattern(filename, filename_pattern):
-                        matching_files.append(path.name)
+                    # Execute the operation
+                    result = method(self, *args, **kwargs)
+                    
+                    # Log success
+                    duration = (datetime.now() - start_time).total_seconds()
+                    logger.info(f"Completed {operation_name} operation: {operation_id} in {duration:.2f}s")
+                    
+                    return result
+                    
+                except Exception as e:
+                    # Log failure with context
+                    duration = (datetime.now() - start_time).total_seconds()
+                    logger.error(f"Failed {operation_name} operation: {operation_id} after {duration:.2f}s - {str(e)}")
+                    
+                    # Attempt cleanup if needed
+                    try:
+                        if len(args) > 1:  # container is usually second argument
+                            container = args[1]
+                            cleanup_result = self.cleanup_failed_writes(container, f"*_temp_{operation_id}*")
+                            if cleanup_result['success']:
+                                logger.info(f"Cleaned up {cleanup_result['temp_files_deleted']} temporary files")
+                    except:
+                        pass  # Cleanup is best effort
+                    
+                    raise RuntimeError(f"{operation_name} operation failed: {str(e)}")
             
-            return sorted(matching_files)
-            
-        except Exception as e:
-            logger.error(f"Failed to resolve wildcard pattern {pattern}: {str(e)}")
-            return []
-    
-    def _list_directory_files(self, file_system_client: FileSystemClient, directory: str) -> List[str]:
-        """
-        List all files in a directory.
-        
-        Args:
-            file_system_client: ADLS file system client
-            directory: Directory path
-            
-        Returns:
-            List of file paths in the directory
-        """
-        try:
-            paths = file_system_client.get_paths(path=directory, recursive=False)
-            
-            file_paths = []
-            for path in paths:
-                if not path.is_directory:
-                    file_paths.append(path.name)
-            
-            return sorted(file_paths)
-            
-        except Exception as e:
-            logger.error(f"Failed to list directory {directory}: {str(e)}")
-            return []
-    
-    def _matches_pattern(self, filename: str, pattern: str) -> bool:
-        """
-        Simple wildcard pattern matching.
-        
-        Args:
-            filename: File name to test
-            pattern: Pattern with * and ? wildcards
-            
-        Returns:
-            True if filename matches pattern
-        """
-        import fnmatch
-        return fnmatch.fnmatch(filename, pattern)
-    
-    def _create_text_dataframe(self, files_data: List[Dict]) -> DataFrame:
-        """
-        Create Spark DataFrame for text files.
-        
-        Args:
-            files_data: List of file data dictionaries
-            
-        Returns:
-            Spark DataFrame with text content
-        """
-        # Define schema for text files
-        schema = StructType([
-            StructField("path", StringType(), False),
-            StructField("modificationTime", TimestampType(), False),
-            StructField("length", LongType(), False),
-            StructField("content", StringType(), True),
-            StructField("encoding", StringType(), True)
-        ])
-        
-        # Convert to Spark DataFrame
-        return self.spark.createDataFrame(files_data, schema)
-    
-    def _create_binary_dataframe(self, files_data: List[Dict]) -> DataFrame:
-        """
-        Create Spark DataFrame for binary files (similar to binaryFile format).
-        
-        Args:
-            files_data: List of file data dictionaries
-            
-        Returns:
-            Spark DataFrame with binary content
-        """
-        # Define schema for binary files (matches Spark's binaryFile format)
-        schema = StructType([
-            StructField("path", StringType(), False),
-            StructField("modificationTime", TimestampType(), False),
-            StructField("length", LongType(), False),
-            StructField("content", BinaryType(), True)
-        ])
-        
-        # Convert to Spark DataFrame
-        return self.spark.createDataFrame(files_data, schema)
-
-
-# # Example usage and testing
-# if __name__ == "__main__":
-#     # Configure logging
-#     logging.basicConfig(level=logging.INFO)
-    
-#     print("DirectADLSReader class created successfully")
-#     print("This class reads files directly from ADLS and converts to Spark DataFrames")
-#     print("\nSupported formats:")
-#     print("- Text files: read_text_files()")
-#     print("- Binary files: read_binary_files()")  
-#     print("- JSON files: read_json_files()")
-#     print("- CSV files: read_csv_files()")
-#     print("\nExample usage:")
-#     print("reader = DirectADLSReader(adls_client, spark)")
-#     print("df = reader.read_text_files('container', 'raw/logs/*.log')")
-#     print("df = reader.read_binary_files('container', 'images/*.jpg')")
-#     print("df = reader.read_json_files('container', 'data/*.json', {'multiLine': True})")
+            return wrapper
+        return decorator
