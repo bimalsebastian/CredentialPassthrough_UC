@@ -32,9 +32,9 @@ except ImportError as e:
     raise ImportError(f"Required Azure libraries not found: {e}. "
                       f"Install: pip install azure-storage-file-datalake pandas")
 
-from path_analyzer import PathAnalyzer
-from authentication_manager import AuthenticationManager
-from uc_passthrough_writer import UCPassthroughWriterProxy, _UCWriteDataFrame
+from .path_analyzer import PathAnalyzer
+from .authentication_manager import AuthenticationManager
+from .uc_passthrough_writer import UCPassthroughWriterProxy, _UCWriteDataFrame
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +203,7 @@ class UCPassthroughFormatReader:
         storage_account_url, container, blob_path = self._parse_adls_path(path)
         adls_client = self.auth_manager.get_adls_client(storage_account_url)
 
-        from direct_adls_reader import DirectADLSReader
+        from .direct_adls_reader import DirectADLSReader
         reader = DirectADLSReader(adls_client, self.spark)
 
         fmt = self.format_type.lower()
@@ -223,9 +223,16 @@ class UCPassthroughFormatReader:
 
         handler = dispatch.get(fmt)
         if handler is None:
-            # Unsupported format for direct access — fall back to UC
-            logger.warning(f"Format '{fmt}' not supported for direct ADLS access, "
-                           f"falling back to Unity Catalog")
+            if fmt == 'delta':
+                logger.info(
+                    f"Delta format always routes through Unity Catalog governance "
+                    f"(transaction log managed by UC). Routing {path} via UC."
+                )
+            else:
+                logger.warning(
+                    f"Format '{fmt}' not supported for direct ADLS access, "
+                    f"falling back to Unity Catalog"
+                )
             return self._load_via_unity_catalog(path)
 
         try:
@@ -381,6 +388,72 @@ class UCPassthroughDataFrameReader:
     def __repr__(self):
         spark = object.__getattribute__(self, '_spark')
         return f"UCPassthroughDataFrameReader(wrapping={repr(spark)})"
+
+
+def create_uc_passthrough_interface(
+    spark,
+    auth_config: Optional[Dict] = None,
+    routing_config: Optional[Dict] = None,
+) -> 'UCPassthroughDataFrameReader':
+    """
+    Convenience factory used by the Validator and other callers that want a
+    zero-boilerplate entry point.
+
+    If auth_config is omitted the manager reads credentials from the standard
+    environment variables:
+        PASSTHROUGH_CLIENT_ID, PASSTHROUGH_CLIENT_SECRET, PASSTHROUGH_TENANT_ID,
+        PASSTHROUGH_USE_INTERACTIVE_FLOW, PASSTHROUGH_USE_CLIENT_CREDENTIALS
+
+    If routing_config is omitted the PathAnalyzer reads from:
+        PASSTHROUGH_CUSTOM_ADLS_FORMATS  (comma-separated)
+        PASSTHROUGH_CUSTOM_UC_FORMATS    (comma-separated)
+        PASSTHROUGH_FORCE_ADLS_PATTERNS  (comma-separated regex)
+        PASSTHROUGH_FORCE_UC_PATTERNS    (comma-separated regex)
+
+    Returns a wrapped SparkSession ready for passthrough reads and writes.
+    """
+    import os
+
+    def _str_to_list(val: str) -> List[str]:
+        """Split a comma-separated env-var string into a stripped list."""
+        if not val:
+            return []
+        return [v.strip() for v in val.split(',') if v.strip()]
+
+    def _str_to_bool(val) -> bool:
+        if isinstance(val, bool):
+            return val
+        return str(val).lower() in ('1', 'true', 'yes')
+
+    if auth_config is None:
+        auth_config = {
+            'client_id':              os.environ.get('PASSTHROUGH_CLIENT_ID', ''),
+            'client_secret':          os.environ.get('PASSTHROUGH_CLIENT_SECRET', ''),
+            'tenant_id':              os.environ.get('PASSTHROUGH_TENANT_ID', ''),
+            'use_interactive_flow':   _str_to_bool(
+                                          os.environ.get('PASSTHROUGH_USE_INTERACTIVE_FLOW', 'false')),
+            'use_client_credentials': _str_to_bool(
+                                          os.environ.get('PASSTHROUGH_USE_CLIENT_CREDENTIALS', 'false')),
+            'cache_tokens':           _str_to_bool(
+                                          os.environ.get('PASSTHROUGH_CACHE_TOKENS', 'true')),
+        }
+
+    if routing_config is None:
+        routing_config = {
+            'custom_adls_formats':  _str_to_list(
+                                        os.environ.get('PASSTHROUGH_CUSTOM_ADLS_FORMATS', '')),
+            'custom_uc_formats':    _str_to_list(
+                                        os.environ.get('PASSTHROUGH_CUSTOM_UC_FORMATS', '')),
+            'force_adls_patterns':  _str_to_list(
+                                        os.environ.get('PASSTHROUGH_FORCE_ADLS_PATTERNS', '')),
+            'force_uc_patterns':    _str_to_list(
+                                        os.environ.get('PASSTHROUGH_FORCE_UC_PATTERNS', '')),
+        }
+
+    auth_manager = AuthenticationManager(auth_config)
+    auth_manager.initialize_user_context(spark)
+    path_analyzer = PathAnalyzer(config=routing_config)
+    return UCPassthroughDataFrameReader(spark, auth_manager, path_analyzer)
 
 
 # --------------------------------------------------------------------------- #
