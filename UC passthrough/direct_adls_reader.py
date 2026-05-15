@@ -415,9 +415,21 @@ class DirectADLSReader:
             all_records = []
             for file_path in file_paths:
                 try:
-                    content_bytes = file_system_client.get_file_client(file_path)\
-                                        .download_file().readall()
-                    records = list(fastavro.reader(io.BytesIO(bytes(content_bytes))))
+                    # download_file() returns a StorageStreamDownloader.
+                    # Call .readall() to get the full content, then explicitly
+                    # wrap in bytes() to handle memoryview returns from some
+                    # SDK versions, and pass a fresh BytesIO so fastavro's
+                    # header reader always starts at position 0.
+                    downloader = file_system_client.get_file_client(file_path).download_file()
+                    raw = downloader.readall()
+                    if not isinstance(raw, (bytes, bytearray)):
+                        raw = bytes(raw)
+                    if len(raw) == 0:
+                        logger.warning(f"Avro file is empty, skipping: {file_path}")
+                        continue
+                    buf = io.BytesIO(raw)
+                    buf.seek(0)
+                    records = list(fastavro.reader(buf))
                     all_records.extend(records)
                 except Exception as e:
                     logger.warning(f"Failed to read Avro file {file_path}: {e}")
