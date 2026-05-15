@@ -1167,17 +1167,26 @@ class DirectADLSWriter:
         for row in pandas_df.itertuples(index=False):
             record = {}
             for col, val in zip(pandas_df.columns, row):
-                if val is None or (isinstance(val, float) and math.isnan(val)):
+                if val is None:
                     record[col] = None
-                elif hasattr(val, 'item'):          # numpy scalar → Python native
-                    record[col] = val.item()
-                elif isinstance(val, datetime.date) and not isinstance(val, datetime.datetime):
-                    record[col] = (val - EPOCH).days   # Avro date = int days since epoch
-                elif isinstance(val, datetime.datetime):
-                    record[col] = int(val.timestamp() * 1000)  # Avro timestamp-millis
+                elif isinstance(val, float) and math.isnan(val):
+                    record[col] = None
                 elif str(type(val)) in ("<class 'pandas._libs.missing.NAType'>",
                                         "<class 'pandas._libs.NaTType'>"):
                     record[col] = None
+                elif isinstance(val, np.generic):
+                    # numpy scalar (int64, float32, bool_, …) → Python native
+                    # Use np.generic check, NOT hasattr(.item), because numpy
+                    # arrays also have .item() but raise when size > 1.
+                    record[col] = val.item()
+                elif isinstance(val, np.ndarray):
+                    # numpy array (e.g. from a Spark array column) → Python list
+                    record[col] = val.tolist()
+                elif isinstance(val, datetime.datetime):
+                    # Must check datetime before date — datetime is a subclass of date
+                    record[col] = int(val.timestamp() * 1000)  # Avro timestamp-millis
+                elif isinstance(val, datetime.date):
+                    record[col] = (val - EPOCH).days            # Avro date logical type
                 else:
                     record[col] = val
             records.append(record)
