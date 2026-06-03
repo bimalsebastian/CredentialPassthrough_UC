@@ -41,6 +41,8 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CHUNK_SIZE_BYTES = 4 * 1024 * 1024  # 4MB
+
 
 class DirectADLSReader:
     """
@@ -60,7 +62,15 @@ class DirectADLSReader:
         self.spark = spark_session
         self.max_files_per_read = 1000  # Safety limit
         self.max_file_size_mb = 100  # Safety limit for individual files
-        
+
+    def _download_with_chunks(self, file_client, chunk_size_bytes: int = DEFAULT_CHUNK_SIZE_BYTES) -> bytes:
+        stream = file_client.download_file(max_concurrency=4)
+        buffer = io.BytesIO()
+        for chunk in stream.chunks():
+            buffer.write(chunk)
+        buffer.seek(0)
+        return buffer.read()
+
     def read_text_files(self, container: str, blob_path: str, 
                        encoding: Optional[str] = None,
                        options: Optional[Dict] = None) -> DataFrame:
@@ -100,9 +110,8 @@ class DirectADLSReader:
                         continue
                     
                     # Download file content
-                    download = file_client.download_file()
-                    content_bytes = download.readall()
-                    
+                    content_bytes = self._download_with_chunks(file_client)
+
                     # Detect encoding if not specified
                     if encoding is None:
                         detected = chardet.detect(content_bytes)
@@ -174,9 +183,8 @@ class DirectADLSReader:
                         continue
                     
                     # Download file content
-                    download = file_client.download_file()
-                    content_bytes = download.readall()
-                    
+                    content_bytes = self._download_with_chunks(file_client)
+
                     # Create file record (similar to Spark's binaryFile format)
                     file_record = {
                         'path': f"abfss://{container}@{self.adls_client.account_name}.dfs.core.windows.net/{file_path}",
@@ -235,8 +243,7 @@ class DirectADLSReader:
                         continue
                     
                     # Download and parse JSON content
-                    download = file_client.download_file()
-                    content_bytes = download.readall()
+                    content_bytes = self._download_with_chunks(file_client)
                     content_text = content_bytes.decode('utf-8')
                     
                     if multiline:
@@ -312,9 +319,8 @@ class DirectADLSReader:
                         continue
                     
                     # Download and parse CSV content
-                    download = file_client.download_file()
-                    content_bytes = download.readall()
-                    
+                    content_bytes = self._download_with_chunks(file_client)
+
                     # Read CSV using pandas
                     csv_data = pd.read_csv(
                         io.BytesIO(content_bytes),
@@ -360,8 +366,8 @@ class DirectADLSReader:
             tables = []
             for file_path in file_paths:
                 try:
-                    content_bytes = file_system_client.get_file_client(file_path)\
-                                        .download_file().readall()
+                    file_client = file_system_client.get_file_client(file_path)
+                    content_bytes = self._download_with_chunks(file_client)
                     tables.append(pq.read_table(pa.BufferReader(content_bytes)))
                 except Exception as e:
                     logger.warning(f"Failed to read parquet file {file_path}: {e}")
@@ -391,8 +397,8 @@ class DirectADLSReader:
             all_data = []
             for file_path in file_paths:
                 try:
-                    content_bytes = file_system_client.get_file_client(file_path)\
-                                        .download_file().readall()
+                    file_client = file_system_client.get_file_client(file_path)
+                    content_bytes = self._download_with_chunks(file_client)
                     table = orc.read_table(io.BytesIO(content_bytes))
                     all_data.append(table.to_pandas())
                 except Exception as e:
@@ -425,13 +431,8 @@ class DirectADLSReader:
             all_records = []
             for file_path in file_paths:
                 try:
-                    # download_file() returns a StorageStreamDownloader.
-                    # Call .readall() to get the full content, then explicitly
-                    # wrap in bytes() to handle memoryview returns from some
-                    # SDK versions, and pass a fresh BytesIO so fastavro's
-                    # header reader always starts at position 0.
-                    downloader = file_system_client.get_file_client(file_path).download_file()
-                    raw = downloader.readall()
+                    file_client = file_system_client.get_file_client(file_path)
+                    raw = self._download_with_chunks(file_client)
                     if not isinstance(raw, (bytes, bytearray)):
                         raw = bytes(raw)
                     if len(raw) == 0:
@@ -482,8 +483,8 @@ class DirectADLSReader:
             all_records = []
             for file_path in file_paths:
                 try:
-                    content_bytes = file_system_client.get_file_client(file_path)\
-                                        .download_file().readall()
+                    file_client = file_system_client.get_file_client(file_path)
+                    content_bytes = self._download_with_chunks(file_client)
                     root = ET.fromstring(content_bytes.decode('utf-8'))
 
                     # Find all elements matching rowTag anywhere in the tree
@@ -564,7 +565,7 @@ class DirectADLSReader:
                                        f"({file_size_mb:.1f} MB)")
                         continue
 
-                    content_bytes = file_client.download_file().readall()
+                    content_bytes = self._download_with_chunks(file_client)
                     yaml_data = yaml.safe_load(content_bytes.decode('utf-8'))
 
                     if yaml_data is None:
@@ -680,7 +681,7 @@ class DirectADLSReader:
                                        f"({file_size_mb:.1f} MB)")
                         continue
 
-                    content_bytes = file_client.download_file().readall()
+                    content_bytes = self._download_with_chunks(file_client)
                     wb = openpyxl.load_workbook(
                         io.BytesIO(content_bytes), read_only=True, data_only=True
                     )
@@ -830,7 +831,7 @@ class DirectADLSReader:
                                        f"({file_size_mb:.1f} MB)")
                         continue
 
-                    content_bytes = file_client.download_file().readall()
+                    content_bytes = self._download_with_chunks(file_client)
 
                     files_data.append({
                         'path': (f"abfss://{container}@"
@@ -899,7 +900,7 @@ class DirectADLSReader:
                                        f"({file_size_mb:.1f} MB)")
                         continue
 
-                    content_bytes = file_client.download_file().readall()
+                    content_bytes = self._download_with_chunks(file_client)
 
                     # mutagen.File can read from a file-like object
                     audio_info = mutagen.File(io.BytesIO(content_bytes))
@@ -970,7 +971,7 @@ class DirectADLSReader:
                                     f"({file_size_mb:.1f} MB)")
                         continue
 
-                    content_bytes = file_client.download_file().readall()
+                    content_bytes = self._download_with_chunks(file_client)
 
                     files_data.append({
                         'path': (f"abfss://{container}@"

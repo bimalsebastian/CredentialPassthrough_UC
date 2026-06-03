@@ -186,9 +186,10 @@ def spark():
 
 
 def make_download_response(content: bytes):
-    """Create a mock download response that returns content on readall()."""
+    """Create a mock download response that supports chunked streaming."""
     download = MagicMock()
     download.readall.return_value = content
+    download.chunks.return_value = iter([content])
     return download
 
 
