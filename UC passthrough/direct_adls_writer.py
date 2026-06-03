@@ -384,32 +384,36 @@ class DirectADLSWriter:
     UPDATED: Modified to preserve original filenames instead of generating new ones.
     """
     
-    def __init__(self, adls_client: DataLakeServiceClient, spark_session: SparkSession):
+    def __init__(self, adls_client: DataLakeServiceClient, spark_session: SparkSession,
+                 options: Optional[Dict] = None):
         """
         Initialize DirectADLSWriter with protected ADLS client.
-        
+
         Args:
             adls_client: Authenticated ADLS client with user credentials (kept private)
             spark_session: Active Spark session for DataFrame operations
+            options: Optional configuration dict (e.g. adls_chunk_size_bytes)
         """
         self.__adls_client = adls_client  # Private - protected from direct access
         self.spark = spark_session
         self.__lock = threading.Lock()  # Thread safety for sensitive operations
-        
+        self._options = options or {}
+
         # Security limits - these are protected from modification
         self.__max_files_per_write = 1000  # Safety limit
         self.__max_partition_files = 100  # Safety limit per partition
         self.__max_file_size_mb = 500  # Safety limit for individual files
-        
+
         logger.debug("DirectADLSWriter initialized with protected ADLS client and ADLS Gen2 fix")
 
     def _upload_with_chunks(self, file_client, data: bytes,
                             chunk_size_bytes: int = DEFAULT_CHUNK_SIZE_BYTES) -> None:
+        chunk_size = self._options.get('adls_chunk_size_bytes', chunk_size_bytes)
         file_client.upload_data(
             data,
             overwrite=True,
             max_concurrency=4,
-            chunk_size=chunk_size_bytes
+            chunk_size=chunk_size
         )
 
     @_protect_adls_method

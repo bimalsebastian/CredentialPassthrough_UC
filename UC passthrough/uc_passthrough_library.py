@@ -204,10 +204,13 @@ class UCPassthroughFormatReader:
         adls_client = self.auth_manager.get_adls_client(storage_account_url)
 
         from .direct_adls_reader import DirectADLSReader
-        reader = DirectADLSReader(adls_client, self.spark)
 
         fmt = self.format_type.lower()
+        # adls_chunk_size_bytes: optional int — override the default 4MB chunk size
+        # for reads and writes. Increase for large files (e.g. 16MB for files >500MB).
+        # Decrease for memory-constrained environments.
         opts = self._user_options()
+        reader = DirectADLSReader(adls_client, self.spark, options=opts)
 
         dispatch = {
                 'csv':        lambda: reader.read_csv_files(container, blob_path, options=opts),

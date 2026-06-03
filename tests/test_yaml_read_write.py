@@ -27,6 +27,7 @@ def _make_writer(mock_adls_client, spark):
     writer._DirectADLSWriter__max_files_per_write = 1000
     writer._DirectADLSWriter__max_partition_files = 100
     writer._DirectADLSWriter__max_file_size_mb = 500
+    writer._options = {}
     return writer
 
 

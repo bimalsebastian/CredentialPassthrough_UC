@@ -243,10 +243,13 @@ class UCPassthroughFormatWriter:
         adls_client = self._auth_manager.get_adls_client(storage_account_url)
 
         from .direct_adls_writer import DirectADLSWriter
-        writer = DirectADLSWriter(adls_client, self._spark)
 
         fmt = self._format_type.lower()
+        # adls_chunk_size_bytes: optional int — override the default 4MB chunk size
+        # for reads and writes. Increase for large files (e.g. 16MB for files >500MB).
+        # Decrease for memory-constrained environments.
         opts = self._user_options()
+        writer = DirectADLSWriter(adls_client, self._spark, options=opts)
         mode = self._write_mode
         partition_cols = self._partition_cols or None
 

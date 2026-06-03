@@ -50,20 +50,24 @@ class DirectADLSReader:
     This bypasses the need for Spark-level credential injection.
     """
     
-    def __init__(self, adls_client: DataLakeServiceClient, spark_session: SparkSession):
+    def __init__(self, adls_client: DataLakeServiceClient, spark_session: SparkSession,
+                 options: Optional[Dict] = None):
         """
         Initialize DirectADLSReader.
-        
+
         Args:
             adls_client: Authenticated ADLS client with user credentials
             spark_session: Active Spark session for DataFrame creation
+            options: Optional configuration dict (e.g. adls_chunk_size_bytes)
         """
         self.adls_client = adls_client
         self.spark = spark_session
         self.max_files_per_read = 1000  # Safety limit
         self.max_file_size_mb = 100  # Safety limit for individual files
+        self._options = options or {}
 
     def _download_with_chunks(self, file_client, chunk_size_bytes: int = DEFAULT_CHUNK_SIZE_BYTES) -> bytes:
+        chunk_size = self._options.get('adls_chunk_size_bytes', chunk_size_bytes)
         stream = file_client.download_file(max_concurrency=4)
         buffer = io.BytesIO()
         for chunk in stream.chunks():
