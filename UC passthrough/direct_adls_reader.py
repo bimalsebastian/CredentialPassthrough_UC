@@ -15,6 +15,10 @@ Optional dependency: mutagen (only needed for audio_mode='metadata')
     Audio binary mode (default) requires no extra dependencies.
 """
 
+# Exception policy: raw exception messages from the Azure SDK are never
+# surfaced to callers. Only exception type and safe path prefix are included
+# in raised exceptions. Full detail is available at DEBUG log level.
+
 import io
 import json
 import logging
@@ -30,14 +34,22 @@ try:
     from pyspark.sql.functions import col, lit
     import pandas as pd
 except ImportError as e:
-    raise ImportError(f"Required libraries not found: {e}")
+    raise ImportError(
+        f"Required libraries not found. "
+        f"Error type: {type(e).__name__}. "
+        f"Ensure pyspark and pandas are installed."
+    )
 
 try:
     from azure.storage.filedatalake import DataLakeServiceClient, FileSystemClient, DataLakeFileClient
     from azure.core.exceptions import ResourceNotFoundError, HttpResponseError
     import chardet  # For encoding detection
 except ImportError as e:
-    raise ImportError(f"Required Azure libraries not found: {e}")
+    raise ImportError(
+        f"Required Azure libraries not found. "
+        f"Error type: {type(e).__name__}. "
+        f"Ensure azure-storage-file-datalake and chardet are installed."
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +74,16 @@ class DirectADLSReader:
         if not decoded or not decoded.strip():
             raise ValueError("Blob path must not be empty.")
         return decoded
+
+    @staticmethod
+    def _safe_path(path: str) -> str:
+        """Return a truncated path safe for logging (container + first segment only)."""
+        if not path:
+            return "<empty>"
+        parts = path.strip('/').split('/')
+        if len(parts) <= 2:
+            return path
+        return f"{parts[0]}/{parts[1]}/..."
 
     def __init__(self, adls_client: DataLakeServiceClient, spark_session: SparkSession,
                  options: Optional[Dict] = None):
@@ -161,8 +183,12 @@ class DirectADLSReader:
             return self._create_text_dataframe(files_data)
             
         except Exception as e:
-            logger.error(f"Failed to read text files from {blob_path}: {str(e)}")
-            raise RuntimeError(f"Text file reading failed: {str(e)}")
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read text file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
     
     def read_binary_files(self, container: str, blob_path: str,
                          options: Optional[Dict] = None) -> DataFrame:
@@ -224,9 +250,13 @@ class DirectADLSReader:
             return self._create_binary_dataframe(files_data)
             
         except Exception as e:
-            logger.error(f"Failed to read binary files from {blob_path}: {str(e)}")
-            raise RuntimeError(f"Binary file reading failed: {str(e)}")
-    
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read binary file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
+
     def read_json_files(self, container: str, blob_path: str,
                        options: Optional[Dict] = None) -> DataFrame:
         """
@@ -298,8 +328,12 @@ class DirectADLSReader:
             return spark_df
             
         except Exception as e:
-            logger.error(f"Failed to read JSON files from {blob_path}: {str(e)}")
-            raise RuntimeError(f"JSON file reading failed: {str(e)}")
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read JSON file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
     
     def read_csv_files(self, container: str, blob_path: str,
                       options: Optional[Dict] = None) -> DataFrame:
@@ -371,8 +405,12 @@ class DirectADLSReader:
             return spark_df
             
         except Exception as e:
-            logger.error(f"Failed to read CSV files from {blob_path}: {str(e)}")
-            raise RuntimeError(f"CSV file reading failed: {str(e)}")
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read CSV file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
     
     def read_parquet_files(self, container: str, blob_path: str,
                         options: Optional[Dict] = None) -> DataFrame:
@@ -402,8 +440,12 @@ class DirectADLSReader:
             return self.spark.createDataFrame(combined.to_pandas())
 
         except Exception as e:
-            logger.error(f"Failed to read parquet files from {blob_path}: {e}")
-            raise RuntimeError(f"Parquet file reading failed: {e}")
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read parquet file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
 
     def read_orc_files(self, container: str, blob_path: str,
@@ -436,8 +478,12 @@ class DirectADLSReader:
         except ImportError:
             raise RuntimeError("PyArrow required for ORC reading: pip install pyarrow")
         except Exception as e:
-            logger.error(f"Failed to read ORC files from {blob_path}: {e}")
-            raise RuntimeError(f"ORC file reading failed: {e}")
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read ORC file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
 
     def read_avro_files(self, container: str, blob_path: str,
@@ -477,8 +523,12 @@ class DirectADLSReader:
         except ImportError:
             raise RuntimeError("fastavro required for Avro reading: pip install fastavro")
         except Exception as e:
-            logger.error(f"Failed to read Avro files from {blob_path}: {e}")
-            raise RuntimeError(f"Avro file reading failed: {e}")
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read Avro file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
     
     def read_xml_files(self, container: str, blob_path: str,
                     options: Optional[Dict] = None) -> DataFrame:
@@ -542,8 +592,12 @@ class DirectADLSReader:
             return self.spark.createDataFrame(pd.DataFrame(all_records))
 
         except Exception as e:
-            logger.error(f"Failed to read XML files from {blob_path}: {e}")
-            raise RuntimeError(f"XML file reading failed: {e}")
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read XML file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
 
     def read_yaml_files(self, container: str, blob_path: str,
@@ -627,8 +681,12 @@ class DirectADLSReader:
         except ImportError:
             raise RuntimeError("PyYAML required for YAML reading: pip install pyyaml")
         except Exception as e:
-            logger.error(f"Failed to read YAML files from {blob_path}: {e}")
-            raise RuntimeError(f"YAML file reading failed: {e}")
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read YAML file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     def _flatten_yaml_dict(self, data: dict, prefix: str = '',
                            current_depth: int = 0, max_depth: int = 3) -> dict:
@@ -775,8 +833,12 @@ class DirectADLSReader:
         except RuntimeError:
             raise
         except Exception as e:
-            logger.error(f"Failed to read XLSX files from {blob_path}: {e}")
-            raise RuntimeError(f"XLSX file reading failed: {e}")
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read XLSX file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     @staticmethod
     def _forward_fill_merged_cells(rows: List[list]) -> List[list]:
@@ -886,8 +948,12 @@ class DirectADLSReader:
         except RuntimeError:
             raise
         except Exception as e:
-            logger.error(f"Failed to read audio files (binary) from {blob_path}: {e}")
-            raise RuntimeError(f"Audio file reading (binary) failed: {e}")
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read audio file (binary) at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     def _read_audio_metadata(self, container: str, blob_path: str,
                              options: Dict) -> DataFrame:
@@ -966,8 +1032,12 @@ class DirectADLSReader:
         except RuntimeError:
             raise
         except Exception as e:
-            logger.error(f"Failed to read audio metadata from {blob_path}: {e}")
-            raise RuntimeError(f"Audio metadata reading failed: {e}")
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read audio metadata at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     def read_binary_files(self, container: str, blob_path: str,
                         options: Optional[Dict] = None) -> DataFrame:
@@ -1027,9 +1097,13 @@ class DirectADLSReader:
             return self.spark.createDataFrame(files_data, schema)
 
         except Exception as e:
-            logger.error(f"Failed to read binary files from {blob_path}: {e}")
-            raise RuntimeError(f"Binary file reading failed: {e}")
-    
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to read binary file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
+
     def _resolve_file_paths(self, file_system_client: FileSystemClient, blob_path: str) -> List[str]:
         try:
             if '*' in blob_path or '?' in blob_path:
@@ -1053,8 +1127,12 @@ class DirectADLSReader:
                 return [blob_path]
 
         except Exception as e:
-            logger.error(f"Failed to resolve file paths for {blob_path}: {str(e)}")
-            raise RuntimeError(f"Path resolution failed: {str(e)}")
+            logger.debug(f"Full exception detail for {self._safe_path(blob_path)}: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to resolve file paths at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
     
     def _resolve_wildcard_paths(self, file_system_client: FileSystemClient, pattern: str) -> List[str]:
         """
