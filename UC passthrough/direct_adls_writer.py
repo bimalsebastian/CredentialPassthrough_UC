@@ -9,6 +9,9 @@ Implements transaction-like behavior for write safety and rollback capabilities.
 
 UPDATED: Fixed ADLS Gen2 x-ms-blob-type header issue by using proper Data Lake API sequence.
 UPDATED: Modified to preserve original filenames instead of generating new ones.
+
+Required dependency: PyYAML (available in standard Databricks Runtime)
+    pip install pyyaml
 """
 
 import io
@@ -1430,6 +1433,98 @@ class DirectADLSWriter:
             logger.error(f"Failed to write image files: {str(e)}")
             raise
 
+    @_protect_adls_method
+    def write_yaml_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                         mode: str = 'error', partition_columns: List[str] = None,
+                         options: Optional[Dict] = None) -> None:
+        """
+        Write DataFrame as a YAML file directly to ADLS.
+
+        Converts the DataFrame to a list of records via pandas .to_dict(orient='records')
+        and serialises using yaml.dump with default_flow_style=False for human-readable output.
+
+        Uses yaml.safe_load/safe_dump only — yaml.load/yaml.dump with Loader are never used.
+
+        Args:
+            dataframe: DataFrame to write
+            container: ADLS container name
+            blob_path: Target path for the YAML file
+            mode: Write mode ('overwrite', 'append', 'ignore', 'error')
+            partition_columns: Optional partition columns
+            options: Additional writing options
+        """
+        try:
+            import yaml
+
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+
+                    if partition_columns:
+                        self._write_partitioned_yaml_files(
+                            dataframe, file_system_client, write_path,
+                            partition_columns, safe_options)
+                    else:
+                        self._write_single_yaml_file(
+                            dataframe, file_system_client, write_path, safe_options)
+
+                logger.info(f"Successfully wrote YAML files to {blob_path} (mode: {mode})")
+
+        except ImportError:
+            raise RuntimeError("PyYAML required for YAML writing: pip install pyyaml")
+        except Exception as e:
+            logger.error(f"Failed to write YAML files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"YAML file writing failed: {str(e)}")
+
+    def _write_single_yaml_file(self, dataframe: DataFrame,
+                                file_system_client: FileSystemClient,
+                                target_path: str, options: Dict) -> None:
+        """Serialise DataFrame to YAML and upload to ADLS."""
+        import yaml
+
+        pandas_df = dataframe.toPandas()
+        records = pandas_df.to_dict(orient='records')
+
+        # yaml.dump with default_flow_style=False for readable block-style output
+        yaml_content = yaml.dump(records, default_flow_style=False,
+                                 allow_unicode=True).encode('utf-8')
+
+        file_client = file_system_client.get_file_client(target_path)
+        _adls_gen2_safe_upload(file_client, yaml_content, True)
+        logger.debug(f"Wrote YAML file: {target_path} ({len(yaml_content)} bytes)")
+
+    def _write_partitioned_yaml_files(self, dataframe: DataFrame,
+                                      file_system_client: FileSystemClient,
+                                      target_path: str, partition_columns: List[str],
+                                      options: Dict) -> None:
+        """Write DataFrame as partitioned YAML files using Hive-style directory layout."""
+        import yaml
+
+        pandas_df = dataframe.toPandas()
+        grouped = pandas_df.groupby(partition_columns)
+
+        for partition_values, group_df in grouped:
+            if len(partition_columns) == 1:
+                partition_values = [partition_values]
+            partition_dir = "/".join(
+                f"{col}={val}" for col, val in zip(partition_columns, partition_values)
+            )
+            output_df = group_df.drop(columns=partition_columns)
+            records = output_df.to_dict(orient='records')
+            yaml_content = yaml.dump(records, default_flow_style=False,
+                                     allow_unicode=True).encode('utf-8')
+            file_path = f"{target_path}/{partition_dir}/part-00000.yaml"
+            file_client = file_system_client.get_file_client(file_path)
+            _adls_gen2_safe_upload(file_client, yaml_content, True)
+            logger.debug(f"Wrote partitioned YAML: {file_path}")
+
     def validate_dataframe_for_format(self, dataframe: DataFrame, format_type: str) -> List[str]:
         """
         Validate DataFrame schema compatibility with target format.
@@ -1507,7 +1602,7 @@ class DirectADLSWriter:
 
     def get_supported_write_operations(self) -> List[str]:
         """Return the list of supported write format operations."""
-        return ['csv', 'json', 'text', 'binaryfile', 'image', 'parquet', 'orc', 'avro', 'xml']
+        return ['csv', 'json', 'yaml', 'text', 'binaryfile', 'image', 'parquet', 'orc', 'avro', 'xml']
 
     def get_supported_write_modes(self) -> List[str]:
         """Return the list of supported write modes."""

@@ -212,6 +212,8 @@ class UCPassthroughFormatReader:
         dispatch = {
                 'csv':        lambda: reader.read_csv_files(container, blob_path, options=opts),
                 'json':       lambda: reader.read_json_files(container, blob_path, options=opts),
+                'yaml':       lambda: reader.read_yaml_files(container, blob_path, options=opts),
+                'yml':        lambda: reader.read_yaml_files(container, blob_path, options=opts),
                 'text':       lambda: reader.read_text_files(container, blob_path,
                                         encoding=opts.get('encoding'), options=opts),
                 'binaryfile': lambda: reader.read_binary_files(container, blob_path, options=opts),

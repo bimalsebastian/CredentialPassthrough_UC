@@ -3,6 +3,9 @@ Direct ADLS File Reader with DataFrame Conversion
 
 This module reads unstructured files directly from ADLS using Python SDK with user credentials,
 then converts the data to Spark DataFrames without requiring Spark-level token injection.
+
+Required dependency: PyYAML (available in standard Databricks Runtime)
+    pip install pyyaml
 """
 
 import io
@@ -509,6 +512,113 @@ class DirectADLSReader:
             logger.error(f"Failed to read XML files from {blob_path}: {e}")
             raise RuntimeError(f"XML file reading failed: {e}")
 
+
+    def read_yaml_files(self, container: str, blob_path: str,
+                        options: Optional[Dict] = None) -> DataFrame:
+        """
+        Read YAML files from ADLS and return a Spark DataFrame with inferred schema.
+
+        Nested keys are flattened using dot notation up to a maximum depth of 3 levels
+        (e.g. config.database.host). Keys nested beyond depth 3 are serialised as a JSON
+        string in a single column.
+
+        Uses yaml.safe_load exclusively — yaml.load is never called.
+
+        Args:
+            container: ADLS container name
+            blob_path: Path to file(s) - supports wildcards
+            options: Additional reading options
+
+        Returns:
+            Spark DataFrame with flattened YAML content
+        """
+        try:
+            import yaml
+
+            file_system_client = self.adls_client.get_file_system_client(container)
+            file_paths = self._resolve_file_paths(file_system_client, blob_path)
+
+            if len(file_paths) > self.max_files_per_read:
+                logger.warning(f"Found {len(file_paths)} files, "
+                               f"limiting to {self.max_files_per_read}")
+                file_paths = file_paths[:self.max_files_per_read]
+
+            all_records = []
+            max_depth = 3
+
+            for file_path in file_paths:
+                try:
+                    file_client = file_system_client.get_file_client(file_path)
+                    properties = file_client.get_file_properties()
+
+                    file_size_mb = properties.size / (1024 * 1024)
+                    if file_size_mb > self.max_file_size_mb:
+                        logger.warning(f"Skipping large file {file_path} "
+                                       f"({file_size_mb:.1f} MB)")
+                        continue
+
+                    content_bytes = file_client.download_file().readall()
+                    yaml_data = yaml.safe_load(content_bytes.decode('utf-8'))
+
+                    if yaml_data is None:
+                        logger.warning(f"Empty YAML file, skipping: {file_path}")
+                        continue
+
+                    # Handle both single-document dicts and lists of dicts
+                    if isinstance(yaml_data, dict):
+                        yaml_data = [yaml_data]
+                    elif not isinstance(yaml_data, list):
+                        yaml_data = [{'value': yaml_data}]
+
+                    for doc in yaml_data:
+                        if not isinstance(doc, dict):
+                            doc = {'value': doc}
+                        record = self._flatten_yaml_dict(doc, max_depth=max_depth)
+                        record['_file_path'] = (
+                            f"abfss://{container}@"
+                            f"{self.adls_client.account_name}"
+                            f".dfs.core.windows.net/{file_path}"
+                        )
+                        all_records.append(record)
+
+                except Exception as e:
+                    logger.warning(f"Failed to read YAML file {file_path}: {e}")
+                    continue
+
+            if not all_records:
+                raise RuntimeError(f"No valid YAML data found in {blob_path}")
+
+            return self.spark.createDataFrame(pd.DataFrame(all_records))
+
+        except ImportError:
+            raise RuntimeError("PyYAML required for YAML reading: pip install pyyaml")
+        except Exception as e:
+            logger.error(f"Failed to read YAML files from {blob_path}: {e}")
+            raise RuntimeError(f"YAML file reading failed: {e}")
+
+    def _flatten_yaml_dict(self, data: dict, prefix: str = '',
+                           current_depth: int = 0, max_depth: int = 3) -> dict:
+        """
+        Flatten a nested dict using dot notation up to max_depth levels.
+        Keys nested beyond max_depth are serialised as a JSON string.
+        """
+        result = {}
+        for key, value in data.items():
+            flat_key = f"{prefix}{key}" if not prefix else f"{prefix}.{key}"
+
+            if isinstance(value, dict) and current_depth < max_depth - 1:
+                nested = self._flatten_yaml_dict(
+                    value, prefix=flat_key, current_depth=current_depth + 1,
+                    max_depth=max_depth
+                )
+                result.update(nested)
+            elif isinstance(value, (dict, list)) and current_depth >= max_depth - 1:
+                # Beyond max depth — serialise as JSON string
+                result[flat_key] = json.dumps(value)
+            else:
+                result[flat_key] = value
+
+        return result
 
     def read_binary_files(self, container: str, blob_path: str,
                         options: Optional[Dict] = None) -> DataFrame:

@@ -54,7 +54,7 @@ class UCPassthroughFormatWriter:
     """
 
     # Formats routed directly to ADLS when path analysis says 'adls'
-    _ADLS_DIRECT_FORMATS = {'csv', 'json', 'text', 'binaryfile', 'image', 'parquet', 'orc', 'avro'}
+    _ADLS_DIRECT_FORMATS = {'csv', 'json', 'yaml', 'yml', 'text', 'binaryfile', 'image', 'parquet', 'orc', 'avro'}
 
     # Formats that always go through UC regardless of path
     _UC_ONLY_FORMATS = {'delta', 'jdbc', 'table'}
@@ -268,6 +268,10 @@ class UCPassthroughFormatWriter:
             'xml':        lambda: writer.write_xml_files(
                               self._df, container, blob_path, mode, partition_cols, opts),
             'image':      lambda: writer.write_image_files(
+                              self._df, container, blob_path, mode, partition_cols, opts),
+            'yaml':       lambda: writer.write_yaml_files(
+                              self._df, container, blob_path, mode, partition_cols, opts),
+            'yml':        lambda: writer.write_yaml_files(
                               self._df, container, blob_path, mode, partition_cols, opts),
         }
 
