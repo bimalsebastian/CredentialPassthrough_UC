@@ -34,7 +34,8 @@ for mod_name in ("azure", "azure.storage", "azure.storage.filedatalake",
 # which won't resolve as flat imports. We fix this by loading each module with
 # importlib and assigning the correct __package__ so relative imports resolve.
 
-_SRC = "/tmp/CredentialPassthrough_UC/UC passthrough"
+import pathlib
+_SRC = str(pathlib.Path(__file__).parent.parent / "UC passthrough")
 _PKG = "uc_pt"
 
 def _load_module(name):
