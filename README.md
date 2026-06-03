@@ -39,6 +39,7 @@ from uc_passthrough_library import UCPassthroughDataFrameReader
 
 # Initialize the passthrough reader
 spark_passthrough = UCPassthroughDataFrameReader(spark)
+spark_passthrough.validate_config()  # Catch misconfiguration early
 
 # Read unstructured data (routes to direct ADLS access)
 df_csv = spark_passthrough.read.format('csv').load('abfss://container@storage.dfs.core.windows.net/data/file.csv')

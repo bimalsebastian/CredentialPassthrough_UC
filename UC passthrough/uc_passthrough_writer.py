@@ -478,7 +478,21 @@ class _UCWriteDataFrame:
 
     def __getattr__(self, name: str):
         df = object.__getattribute__(self, '_df')
-        return getattr(df, name)
+        attr = getattr(df, name)
+        if not callable(attr):
+            return attr
+
+        def _rewrap(*args, **kwargs):
+            result = attr(*args, **kwargs)
+            if isinstance(result, DataFrame):
+                return _UCWriteDataFrame(
+                    dataframe=result,
+                    spark_session=object.__getattribute__(self, '_spark'),
+                    auth_manager=object.__getattribute__(self, '_auth_manager'),
+                    path_analyzer=object.__getattribute__(self, '_path_analyzer'),
+                )
+            return result
+        return _rewrap
 
     def __repr__(self) -> str:
         df = object.__getattribute__(self, '_df')

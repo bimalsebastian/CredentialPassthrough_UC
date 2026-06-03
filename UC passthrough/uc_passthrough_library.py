@@ -38,6 +38,11 @@ from .uc_passthrough_writer import UCPassthroughWriterProxy, _UCWriteDataFrame
 
 logger = logging.getLogger(__name__)
 
+
+class ConfigurationError(ValueError):
+    """Raised when required passthrough configuration is missing or invalid."""
+    pass
+
 SUPPORTED_READ_FORMATS = frozenset({
     'parquet', 'orc', 'avro', 'csv', 'json', 'jsonl', 'tsv',
     'text', 'xml', 'binaryfile', 'binary', 'image',
@@ -148,9 +153,16 @@ class UCPassthroughFormatReader:
                         f"({'; '.join(analysis['reasoning'])})")
 
             if access_method == 'uc':
-                return self._load_via_unity_catalog(path)
+                df = self._load_via_unity_catalog(path)
             else:
-                return self._load_via_adls_direct(path)
+                df = self._load_via_adls_direct(path)
+
+            return _UCWriteDataFrame(
+                dataframe=df,
+                spark_session=self.spark,
+                auth_manager=self.__auth_manager,
+                path_analyzer=self.__path_analyzer,
+            )
 
         except Exception as e:
             logger.error(f"Failed to load {self._safe_path(path)}")
@@ -369,6 +381,90 @@ class UCPassthroughDataFrameReader:
         object.__setattr__(self, '_auth_manager', auth_manager)
         object.__setattr__(self, '_path_analyzer', path_analyzer)
 
+        import os
+        if os.environ.get('PASSTHROUGH_VALIDATE_ON_INIT', '').lower() == 'true':
+            self.validate_config()
+
+    # ------------------------------------------------------------------ #
+    #  Configuration validation                                            #
+    # ------------------------------------------------------------------ #
+
+    def validate_config(self) -> None:
+        """
+        Validates that all required configuration is present and correctly
+        named before the first ADLS operation. Raises ConfigurationError
+        with a specific, actionable message for each missing or invalid value.
+
+        Call this at notebook startup after initialising the reader to catch
+        misconfiguration early rather than at first read/write.
+
+        Example:
+            spark_passthrough = UCPassthroughDataFrameReader(spark)
+            spark_passthrough.validate_config()  # raises immediately if misconfigured
+        """
+        import os
+
+        client_id = os.environ.get('PASSTHROUGH_CLIENT_ID', '').strip()
+        if not client_id:
+            raise ConfigurationError(
+                "PASSTHROUGH_CLIENT_ID is not set or is empty. "
+                "Set this to your Azure AD Service Principal client ID. "
+                "See README.md — Configuration — Environment Variables."
+            )
+
+        client_secret = os.environ.get('PASSTHROUGH_CLIENT_SECRET', '').strip()
+        if not client_secret:
+            raise ConfigurationError(
+                "PASSTHROUGH_CLIENT_SECRET is not set or is empty. "
+                "Set this to your Azure AD Service Principal client secret. "
+                "See README.md — Configuration — Environment Variables."
+            )
+
+        tenant_id = os.environ.get('PASSTHROUGH_TENANT_ID', '').strip()
+        if not tenant_id:
+            raise ConfigurationError(
+                "PASSTHROUGH_TENANT_ID is not set or is empty. "
+                "Set this to your Azure AD tenant ID. "
+                "See README.md — Configuration — Environment Variables."
+            )
+
+        use_client_creds = os.environ.get(
+            'PASSTHROUGH_USE_CLIENT_CREDENTIALS', '').lower() == 'true'
+        use_interactive = os.environ.get(
+            'PASSTHROUGH_USE_INTERACTIVE_FLOW', '').lower() == 'true'
+
+        if use_client_creds and use_interactive:
+            raise ConfigurationError(
+                "Both PASSTHROUGH_USE_CLIENT_CREDENTIALS and "
+                "PASSTHROUGH_USE_INTERACTIVE_FLOW are set to 'True'. "
+                "Exactly one authentication method must be enabled. "
+                "See README.md — Configuration — Authentication Modes."
+            )
+        if not use_client_creds and not use_interactive:
+            raise ConfigurationError(
+                "Neither PASSTHROUGH_USE_CLIENT_CREDENTIALS nor "
+                "PASSTHROUGH_USE_INTERACTIVE_FLOW is set to 'True'. "
+                "Exactly one authentication method must be enabled. "
+                "See README.md — Configuration — Authentication Modes."
+            )
+
+        storage_url = os.environ.get('PASSTHROUGH_STORAGE_URL', '').strip()
+        if storage_url:
+            if not storage_url.startswith('https://'):
+                raise ConfigurationError(
+                    f"PASSTHROUGH_STORAGE_URL must start with 'https://'. "
+                    f"Got: '{storage_url}'. "
+                    "See README.md — Configuration — Environment Variables."
+                )
+            if not storage_url.endswith('.dfs.core.windows.net'):
+                raise ConfigurationError(
+                    f"PASSTHROUGH_STORAGE_URL must end with '.dfs.core.windows.net'. "
+                    f"Got: '{storage_url}'. "
+                    "See README.md — Configuration — Environment Variables."
+                )
+
+        logger.info("Configuration validation passed.")
+
     # ------------------------------------------------------------------ #
     #  .read property — returns our reader, not spark.read                 #
     # ------------------------------------------------------------------ #
@@ -399,6 +495,14 @@ class UCPassthroughDataFrameReader:
         This property exists so that spark.write raises a clear error if called
         directly without a DataFrame, matching native Spark behaviour.
         """
+        logger.warning(
+            "UC Passthrough write intercept is not active on this DataFrame. "
+            "Native Spark DataFrameWriter will be used — this will fail on UC "
+            "passthrough clusters as ADLS credentials are not configured for "
+            "Spark's Hadoop layer. "
+            "Call spark_passthrough.patch_dataframe_write(df) before writing, "
+            "or use spark_passthrough.write directly."
+        )
         raise AttributeError(
             "spark.write requires a DataFrame. Use df.write instead. "
             "Wrap your DataFrame with spark.patch_dataframe_write(df) to get "
