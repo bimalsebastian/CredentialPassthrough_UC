@@ -49,6 +49,8 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CHUNK_SIZE_BYTES = 4 * 1024 * 1024  # 4MB
+
 
 def _protect_adls_method(method):
     """Decorator to protect ADLS client access methods from external access."""
@@ -400,7 +402,16 @@ class DirectADLSWriter:
         self.__max_file_size_mb = 500  # Safety limit for individual files
         
         logger.debug("DirectADLSWriter initialized with protected ADLS client and ADLS Gen2 fix")
-    
+
+    def _upload_with_chunks(self, file_client, data: bytes,
+                            chunk_size_bytes: int = DEFAULT_CHUNK_SIZE_BYTES) -> None:
+        file_client.upload_data(
+            data,
+            overwrite=True,
+            max_concurrency=4,
+            chunk_size=chunk_size_bytes
+        )
+
     @_protect_adls_method
     def write_text_files(self, dataframe: DataFrame, container: str, blob_path: str,
                         mode: str = 'error', partition_columns: List[str] = None,
@@ -505,7 +516,7 @@ class DirectADLSWriter:
             buf.close()
 
             file_client = file_system_client.get_file_client(target_path)
-            _adls_gen2_safe_upload(file_client, content, True)
+            self._upload_with_chunks(file_client, content)
             logger.debug(f"Wrote JSON file: {target_path} ({len(content)} bytes)")
 
         except Exception as e:
@@ -535,7 +546,7 @@ class DirectADLSWriter:
                 content = buf.getvalue().encode('utf-8')
                 buf.close()
                 file_client = file_system_client.get_file_client(full_partition_path)
-                _adls_gen2_safe_upload(file_client, content, True)
+                self._upload_with_chunks(file_client, content)
                 logger.debug(f"Wrote partitioned JSON file: {full_partition_path}")
 
         except Exception as e:
@@ -665,9 +676,9 @@ class DirectADLSWriter:
                 file_path = target_path
                 # print(f"Writing CSV file: {file_path}")
                 
-                # Upload CSV content using safe ADLS Gen2 method
+                # Upload CSV content using chunked upload
                 file_client = file_system_client.get_file_client(file_path)
-                _adls_gen2_safe_upload(file_client, csv_content, overwrite)
+                self._upload_with_chunks(file_client, csv_content)
                
 
                 logger.debug(f"Wrote CSV file: {file_path} ({len(csv_content)} bytes)")
@@ -705,7 +716,7 @@ class DirectADLSWriter:
                 content = buf.getvalue().encode('utf-8')
                 buf.close()
                 file_client = file_system_client.get_file_client(full_partition_path)
-                _adls_gen2_safe_upload(file_client, content, True)
+                self._upload_with_chunks(file_client, content)
                 logger.debug(f"Wrote partitioned CSV file: {full_partition_path}")
 
         except Exception as e:
@@ -782,10 +793,10 @@ class DirectADLSWriter:
                 # Create target file path
                 target_file_path = f"{target_path}/{filename}"
                 
-                # Upload binary content using safe method
+                # Upload binary content
                 file_client = file_system_client.get_file_client(target_file_path)
-                _adls_gen2_safe_upload(file_client, row['content'], True)
-                
+                self._upload_with_chunks(file_client, row['content'])
+
                 logger.debug(f"Wrote binary file: {target_file_path}")
                 
         except Exception as e:
@@ -825,8 +836,8 @@ class DirectADLSWriter:
                     
                     # Upload binary content
                     file_client = file_system_client.get_file_client(file_path)
-                    _adls_gen2_safe_upload(file_client, row['content'], True)
-                    
+                    self._upload_with_chunks(file_client, row['content'])
+
                     logger.debug(f"Wrote partitioned binary file: {file_path}")
                     
         except Exception as e:
@@ -853,10 +864,10 @@ class DirectADLSWriter:
             file_path = f"{target_path}/{filename}"
             
             file_client = file_system_client.get_file_client(file_path)
-            
-            # Upload text content using safe ADLS Gen2 method
-            _adls_gen2_safe_upload(file_client, text_content, True)
-            
+
+            # Upload text content
+            self._upload_with_chunks(file_client, text_content)
+
             logger.debug(f"Wrote text file: {file_path}")
             
         except Exception as e:
@@ -899,8 +910,8 @@ class DirectADLSWriter:
                 file_path = f"{full_partition_path}/{filename}"
                 
                 file_client = file_system_client.get_file_client(file_path)
-                _adls_gen2_safe_upload(file_client, text_content, True)
-                
+                self._upload_with_chunks(file_client, text_content)
+
                 logger.debug(f"Wrote partitioned text file: {file_path}")
                 
         except Exception as e:
@@ -966,7 +977,7 @@ class DirectADLSWriter:
             kwargs['row_group_size'] = row_group_size
         pq.write_table(arrow_table, buf, **kwargs)
         file_client = file_system_client.get_file_client(target_path)
-        _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+        self._upload_with_chunks(file_client, buf.getvalue())
         logger.debug(f"Wrote Parquet file: {target_path} ({buf.tell()} bytes)")
 
     def _write_partitioned_parquet(self, arrow_table, file_system_client: FileSystemClient,
@@ -995,7 +1006,7 @@ class DirectADLSWriter:
             pq.write_table(part_table, buf, **kwargs)
             file_path = f"{target_path}/{partition_dir}/part-00000.parquet"
             file_client = file_system_client.get_file_client(file_path)
-            _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+            self._upload_with_chunks(file_client, buf.getvalue())
             logger.debug(f"Wrote partitioned Parquet: {file_path}")
 
     @_protect_adls_method
@@ -1067,7 +1078,7 @@ class DirectADLSWriter:
         buf = io.BytesIO()
         orc.write_table(arrow_table, buf, compression=compression)
         file_client = file_system_client.get_file_client(target_path)
-        _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+        self._upload_with_chunks(file_client, buf.getvalue())
         logger.debug(f"Wrote ORC file: {target_path}")
 
     def _write_partitioned_orc(self, arrow_table, file_system_client: FileSystemClient,
@@ -1089,7 +1100,7 @@ class DirectADLSWriter:
             orc.write_table(part_table, buf, compression=compression)
             file_path = f"{target_path}/{partition_dir}/part-00000.orc"
             file_client = file_system_client.get_file_client(file_path)
-            _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+            self._upload_with_chunks(file_client, buf.getvalue())
             logger.debug(f"Wrote partitioned ORC: {file_path}")
 
     @_protect_adls_method
@@ -1221,7 +1232,7 @@ class DirectADLSWriter:
         buf = io.BytesIO()
         fastavro.writer(buf, schema, records, codec=codec)
         file_client = file_system_client.get_file_client(target_path)
-        _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+        self._upload_with_chunks(file_client, buf.getvalue())
         logger.debug(f"Wrote Avro file: {target_path}")
 
     def _write_partitioned_avro(self, pandas_df, file_system_client: FileSystemClient,
@@ -1242,7 +1253,7 @@ class DirectADLSWriter:
             fastavro.writer(buf, schema, records, codec=codec)
             file_path = f"{target_path}/{partition_dir}/part-00000.avro"
             file_client = file_system_client.get_file_client(file_path)
-            _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+            self._upload_with_chunks(file_client, buf.getvalue())
             logger.debug(f"Wrote partitioned Avro: {file_path}")
 
     @_protect_adls_method
@@ -1304,7 +1315,7 @@ class DirectADLSWriter:
         declaration = '<?xml version="1.0" encoding="' + encoding + '"?>\n'
         content = (declaration + xml_body).encode(encoding)
         file_client = file_system_client.get_file_client(target_path)
-        _adls_gen2_safe_upload(file_client, content, True)
+        self._upload_with_chunks(file_client, content)
         logger.debug(f"Wrote XML file: {target_path} ({len(content)} bytes)")
 
     def _write_partitioned_xml_files(self, dataframe: DataFrame,
@@ -1336,7 +1347,7 @@ class DirectADLSWriter:
             content = (declaration + xml_body).encode(encoding)
             file_path = f'{target_path}/{partition_dir}/part-00000.xml'
             file_client = file_system_client.get_file_client(file_path)
-            _adls_gen2_safe_upload(file_client, content, True)
+            self._upload_with_chunks(file_client, content)
             logger.debug(f"Wrote partitioned XML: {file_path}")
 
     @_protect_adls_method
@@ -1428,7 +1439,7 @@ class DirectADLSWriter:
 
                 target_file_path = f"{target_path}/{filename}"
                 file_client = file_system_client.get_file_client(target_file_path)
-                _adls_gen2_safe_upload(file_client, row['content'], True)
+                self._upload_with_chunks(file_client, row['content'])
 
                 logger.debug(f"Wrote image file: {target_file_path}")
 
@@ -1502,7 +1513,7 @@ class DirectADLSWriter:
                                  allow_unicode=True).encode('utf-8')
 
         file_client = file_system_client.get_file_client(target_path)
-        _adls_gen2_safe_upload(file_client, yaml_content, True)
+        self._upload_with_chunks(file_client, yaml_content)
         logger.debug(f"Wrote YAML file: {target_path} ({len(yaml_content)} bytes)")
 
     def _write_partitioned_yaml_files(self, dataframe: DataFrame,
@@ -1527,7 +1538,7 @@ class DirectADLSWriter:
                                      allow_unicode=True).encode('utf-8')
             file_path = f"{target_path}/{partition_dir}/part-00000.yaml"
             file_client = file_system_client.get_file_client(file_path)
-            _adls_gen2_safe_upload(file_client, yaml_content, True)
+            self._upload_with_chunks(file_client, yaml_content)
             logger.debug(f"Wrote partitioned YAML: {file_path}")
 
     @_protect_adls_method
@@ -1620,7 +1631,7 @@ class DirectADLSWriter:
         xlsx_bytes = buf.getvalue()
 
         file_client = file_system_client.get_file_client(target_path)
-        _adls_gen2_safe_upload(file_client, xlsx_bytes, True)
+        self._upload_with_chunks(file_client, xlsx_bytes)
         logger.debug(f"Wrote XLSX file: {target_path} ({len(xlsx_bytes)} bytes)")
 
     def _write_partitioned_xlsx_files(self, dataframe: DataFrame,
@@ -1665,7 +1676,7 @@ class DirectADLSWriter:
 
             file_path = f"{target_path}/{partition_dir}/part-00000.xlsx"
             file_client = file_system_client.get_file_client(file_path)
-            _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+            self._upload_with_chunks(file_client, buf.getvalue())
             logger.debug(f"Wrote partitioned XLSX: {file_path}")
 
     SUPPORTED_AUDIO_EXTENSIONS = {'wav', 'mp3', 'flac', 'aac', 'ogg', 'm4a'}
@@ -1757,7 +1768,7 @@ class DirectADLSWriter:
 
                 target_file_path = f"{target_path}/{filename}"
                 file_client = file_system_client.get_file_client(target_file_path)
-                _adls_gen2_safe_upload(file_client, row['content'], True)
+                self._upload_with_chunks(file_client, row['content'])
 
                 logger.debug(f"Wrote audio file: {target_file_path}")
 
