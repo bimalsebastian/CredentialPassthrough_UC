@@ -225,12 +225,12 @@ class UCPassthroughFormatReader:
 
     def _load_via_adls_direct(self, path: str) -> DataFrame:
         """Direct ADLS read using the user's credential token."""
-        if not self.__auth_manager.is_authenticated():
+        if not self.__auth_manager.is_authenticated:
             raise RuntimeError("User not authenticated. Call auth_manager.initialize_user_context() first.")
 
         path = PathAnalyzer.validate_and_normalise_path(path)
         storage_account_url, container, blob_path = self._parse_adls_path(path)
-        adls_client = self.__auth_manager.get_adls_client(storage_account_url)
+        adls_client = self.__auth_manager._get_adls_client(storage_account_url)
 
         from .direct_adls_reader import DirectADLSReader
 
@@ -354,6 +354,16 @@ class UCPassthroughDataFrameReader:
     def __init__(self, spark_session: SparkSession,
                  auth_manager: AuthenticationManager,
                  path_analyzer: PathAnalyzer):
+        if not isinstance(auth_manager, AuthenticationManager):
+            raise TypeError(
+                "auth_manager must be an instance of AuthenticationManager. "
+                "Substituting a custom auth manager is not permitted."
+            )
+        if not isinstance(path_analyzer, PathAnalyzer):
+            raise TypeError(
+                "path_analyzer must be an instance of PathAnalyzer. "
+                "Substituting a custom path analyzer is not permitted."
+            )
         # Store under mangled names so __getattr__ doesn't intercept them
         object.__setattr__(self, '_spark', spark_session)
         object.__setattr__(self, '_auth_manager', auth_manager)

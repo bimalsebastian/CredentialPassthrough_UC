@@ -141,6 +141,22 @@ class AuthenticationManager:
     - Provides ADLS clients with user-scoped permissions
     """
 
+    __slots__ = (
+        '_AuthenticationManager__config',
+        '_AuthenticationManager__client_id',
+        '_AuthenticationManager__client_secret',
+        '_AuthenticationManager__tenant_id',
+        '_AuthenticationManager__authority',
+        '_AuthenticationManager__msal_app',
+        '_AuthenticationManager__token_cache',
+        '_AuthenticationManager__current_user',
+        '_AuthenticationManager__current_user_upn',
+        '_AuthenticationManager__current_user_object_id',
+        '_AuthenticationManager__cache_enabled',
+        '_AuthenticationManager__use_client_credentials',
+        '_AuthenticationManager__use_interactive_flow',
+    )
+
     # Azure AD scopes for different services
     ADLS_SCOPE = "https://storage.azure.com/.default"
 
@@ -198,12 +214,12 @@ class AuthenticationManager:
         self.__client_secret = config['client_secret']
         self.__tenant_id = config['tenant_id']
         self.__authority = config.get('authority', f"https://login.microsoftonline.com/{self.__tenant_id}")
-        self.cache_enabled = self._coerce_bool(config.get('cache_tokens', True))
-        self.use_client_credentials = self._coerce_bool(config.get('use_client_credentials', False))
-        self.use_interactive_flow = self._coerce_bool(config.get('use_interactive_flow', False))
+        self.__cache_enabled = self._coerce_bool(config.get('cache_tokens', True))
+        self.__use_client_credentials = self._coerce_bool(config.get('use_client_credentials', False))
+        self.__use_interactive_flow = self._coerce_bool(config.get('use_interactive_flow', False))
 
         # Initialize MSAL confidential client
-        if self.use_client_credentials:
+        if self.__use_client_credentials:
             self.__msal_app = msal.ConfidentialClientApplication(
                 client_id=self.__client_id,
                 client_credential=self.__client_secret,
@@ -217,7 +233,7 @@ class AuthenticationManager:
             )
 
         # Token cache
-        self.__token_cache = TokenCache() if self.cache_enabled else None
+        self.__token_cache = TokenCache() if self.__cache_enabled else None
 
         # Current user context
         self.__current_user = None
@@ -227,7 +243,7 @@ class AuthenticationManager:
         logger.info("AuthenticationManager initialized with Service Principal auth")
 
     def __repr__(self):
-        return f"AuthenticationManager(authenticated={self.is_authenticated()}, user=***)"
+        return f"AuthenticationManager(authenticated={self.is_authenticated}, user=***)"
 
     def __str__(self):
         return self.__repr__()
@@ -273,7 +289,7 @@ class AuthenticationManager:
             logger.error("Failed to initialize user context")
             raise RuntimeError("User context initialization failed")
 
-    def get_adls_client(self, storage_account_url: str) -> DataLakeServiceClient:
+    def _get_adls_client(self, storage_account_url: str) -> DataLakeServiceClient:
         """
         Get authenticated ADLS client using Service Principal with user context.
 
@@ -338,10 +354,10 @@ class AuthenticationManager:
                 return cached_token
 
         try:
-            if self.use_client_credentials:
+            if self.__use_client_credentials:
                 # Use client credentials flow (SPN has admin consent to access on behalf of users)
                 result = self.__msal_app.acquire_token_for_client(scopes=[self.ADLS_SCOPE])
-            if self.use_interactive_flow:
+            if self.__use_interactive_flow:
                 result = self._get_user_token_interactive_azure_ad(scopes=[self.ADLS_SCOPE])
             if "access_token" not in result:
                 error_msg = result.get("error_description", "Unknown error")
@@ -541,6 +557,7 @@ class AuthenticationManager:
         """Get current user's Azure AD object ID."""
         return self.__current_user_object_id
 
+    @property
     def is_authenticated(self) -> bool:
         """Check if user context is initialized."""
         return self.__current_user is not None
@@ -569,7 +586,7 @@ class AuthenticationManager:
         Returns:
             Dictionary with test results
         """
-        if not self.is_authenticated():
+        if not self.is_authenticated:
             return {
                 'success': False,
                 'error': 'User context not initialized',
@@ -578,7 +595,7 @@ class AuthenticationManager:
 
         try:
             # Get ADLS client
-            adls_client = self.get_adls_client(storage_account_url)
+            adls_client = self._get_adls_client(storage_account_url)
             file_system_client = adls_client.get_file_system_client(container)
 
             # Test basic access by listing files
@@ -637,7 +654,7 @@ class AuthenticationManager:
             warnings.append("MSAL application error")
 
         # Validate admin consent requirement
-        if self.use_client_credentials:
+        if self.__use_client_credentials:
             warnings.append("INFO: Service Principal requires admin consent for https://storage.azure.com/.default scope")
 
         return warnings

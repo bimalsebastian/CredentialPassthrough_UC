@@ -239,14 +239,14 @@ class UCPassthroughFormatWriter:
 
     def _write_via_adls_direct(self, path: str) -> None:
         """Direct ADLS write using the user's credential token."""
-        if not self._auth_manager.is_authenticated():
+        if not self._auth_manager.is_authenticated:
             raise RuntimeError(
                 "User not authenticated. Call auth_manager.initialize_user_context() first."
             )
 
         path = PathAnalyzer.validate_and_normalise_path(path)
         storage_account_url, container, blob_path = self._parse_adls_path(path)
-        adls_client = self._auth_manager.get_adls_client(storage_account_url)
+        adls_client = self._auth_manager._get_adls_client(storage_account_url)
 
         from .direct_adls_writer import DirectADLSWriter
 
