@@ -1,5 +1,8 @@
 # Unity Catalog Credential Passthrough Library
 
+<!-- TODO: Replace YOUR_ORG/YOUR_REPO with the actual GitHub org and repo name before pushing -->
+![CI](https://github.com/YOUR_ORG/YOUR_REPO/actions/workflows/ci.yml/badge.svg)
+
 A secure credential passthrough solution for Databricks Unity Catalog clusters that enables direct access to unstructured data while maintaining proper governance for structured data.
 
 ## Overview

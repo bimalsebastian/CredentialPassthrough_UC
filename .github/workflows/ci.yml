@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov
+          pip install msal azure-storage-file-datalake azure-identity \
+                      pandas pyarrow fastavro chardet openpyxl PyYAML
+          # mutagen is optional — install for full test coverage
+          pip install mutagen
+
+      - name: Run full test suite
+        run: |
+          pytest tests/ -v --tb=short \
+            --cov=. --cov-report=term-missing \
+            --ignore=tests/test_security.py
+
+      - name: Run security tests (separate gate)
+        run: |
+          pytest tests/test_security.py -v --tb=short
+
+      - name: Assert no readall() regression
+        run: |
+          python -c "
+          import ast, sys, pathlib
+          for f in ['direct_adls_reader.py', 'direct_adls_writer.py']:
+              p = pathlib.Path('UC passthrough') / f
+              if not p.exists():
+                  continue
+              src = p.read_text()
+              if 'readall()' in src:
+                  print(f'FAIL: readall() found in {f}')
+                  sys.exit(1)
+          print('PASS: no readall() regression found')
+          "
+
+      - name: Assert no raw str(e) in raise statements
+        run: |
+          python -c "
+          import pathlib, sys, re
+          pattern = re.compile(r'raise\s+\w+\([^)]*str\(e\)[^)]*\)')
+          found = False
+          for f in pathlib.Path('UC passthrough').glob('*.py'):
+              src = f.read_text()
+              matches = pattern.findall(src)
+              if matches:
+                  print(f'FAIL: raw str(e) in raise statement in {f}: {matches}')
+                  found = True
+          if found:
+              sys.exit(1)
+          print('PASS: no raw exception leakage found')
+          "
