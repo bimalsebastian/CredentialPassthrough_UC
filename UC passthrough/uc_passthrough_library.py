@@ -52,12 +52,34 @@ class UCPassthroughFormatReader:
     - shorthand format methods (csv, json, parquet, text, orc, avro) added
     """
 
+    @staticmethod
+    def _safe_path(path: str) -> str:
+        """Return a truncated path safe for logging (container + first segment only)."""
+        if not path:
+            return "<empty>"
+        parts = path.strip('/').split('/')
+        if len(parts) <= 2:
+            return path
+        return f"{parts[0]}/{parts[1]}/..."
+
+    @staticmethod
+    def _scrub_options(options: dict) -> dict:
+        """Return a copy of options with sensitive values redacted."""
+        if not options:
+            return {}
+        sensitive_keys = {
+            'sas_token', 'account_key', 'credential', 'token',
+            'client_secret', 'client_id', 'tenant_id',
+            'adls_chunk_size_bytes'
+        }
+        return {k: '***' if k in sensitive_keys else v for k, v in options.items()}
+
     def __init__(self, format_type: str, spark_session: SparkSession,
                  auth_manager: AuthenticationManager, path_analyzer: PathAnalyzer):
         self.format_type = format_type
         self.spark = spark_session
-        self.auth_manager = auth_manager
-        self.path_analyzer = path_analyzer
+        self.__auth_manager = auth_manager
+        self.__path_analyzer = path_analyzer
         self._read_options: Dict[str, Any] = {}   # renamed — avoids clash with options()
         self._schema = None                         # renamed — avoids clash with schema()
 
@@ -111,12 +133,12 @@ class UCPassthroughFormatReader:
         explicit_override = self._read_options.get('uc_passthrough_override')
 
         try:
-            access_method, analysis = self.path_analyzer.analyze_path(
+            access_method, analysis = self.__path_analyzer.analyze_path(
                 path=path,
                 format_type=self.format_type,
                 explicit_override=explicit_override
             )
-            logger.info(f"Routing {path} → {access_method} "
+            logger.info(f"Routing {self._safe_path(path)} → {access_method} "
                         f"({'; '.join(analysis['reasoning'])})")
 
             if access_method == 'uc':
@@ -125,8 +147,8 @@ class UCPassthroughFormatReader:
                 return self._load_via_adls_direct(path)
 
         except Exception as e:
-            logger.error(f"Failed to load {path}: {e}")
-            raise RuntimeError(f"Data loading failed: {e}")
+            logger.error(f"Failed to load {self._safe_path(path)}")
+            raise RuntimeError(f"Data loading failed for {self._safe_path(path)}")
 
     # ------------------------------------------------------------------ #
     #  Shorthand format methods  (mirrors spark.read.csv(...) etc.)        #
@@ -177,7 +199,7 @@ class UCPassthroughFormatReader:
         try:
             return self.spark.read.table(table_name)
         except Exception as e:
-            raise RuntimeError(f"Table load failed for {table_name}: {e}")
+            raise RuntimeError(f"Table load failed for {table_name}")
 
     # ------------------------------------------------------------------ #
     #  Routing implementations                                             #
@@ -197,11 +219,11 @@ class UCPassthroughFormatReader:
 
     def _load_via_adls_direct(self, path: str) -> DataFrame:
         """Direct ADLS read using the user's credential token."""
-        if not self.auth_manager.is_authenticated():
+        if not self.__auth_manager.is_authenticated():
             raise RuntimeError("User not authenticated. Call auth_manager.initialize_user_context() first.")
 
         storage_account_url, container, blob_path = self._parse_adls_path(path)
-        adls_client = self.auth_manager.get_adls_client(storage_account_url)
+        adls_client = self.__auth_manager.get_adls_client(storage_account_url)
 
         from .direct_adls_reader import DirectADLSReader
 
@@ -235,7 +257,7 @@ class UCPassthroughFormatReader:
             if fmt == 'delta':
                 logger.info(
                     f"Delta format always routes through Unity Catalog governance "
-                    f"(transaction log managed by UC). Routing {path} via UC."
+                    f"(transaction log managed by UC). Routing via UC."
                 )
             else:
                 logger.warning(
@@ -247,7 +269,7 @@ class UCPassthroughFormatReader:
         try:
             return handler()
         except Exception as e:
-            raise RuntimeError(f"ADLS direct read failed for {path}: {e}")
+            raise RuntimeError(f"ADLS direct read failed for {self._safe_path(path)}")
 
     def _load_structured_direct(self, reader, container: str, blob_path: str) -> DataFrame:
         """Read parquet directly via PyArrow without Spark token injection."""
@@ -546,4 +568,4 @@ class UCPassthroughReaderProxy:
 
     def __repr__(self):
         return (f"UCPassthroughReaderProxy(format={self._reader.format_type}, "
-                f"options={self._reader._read_options})")
+                f"options={UCPassthroughFormatReader._scrub_options(self._reader._read_options)})")
