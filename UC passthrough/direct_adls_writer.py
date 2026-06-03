@@ -19,6 +19,10 @@ Required dependency: openpyxl (NOT included in Databricks Runtime by default —
 Audio format write: no additional dependencies (binary passthrough only).
 """
 
+# Exception policy: raw exception messages from the Azure SDK are never
+# surfaced to callers. Only exception type and safe path prefix are included
+# in raised exceptions. Full detail is available at DEBUG log level.
+
 import io
 import json
 import logging
@@ -39,13 +43,21 @@ try:
     import pyarrow as pa
     import pyarrow.parquet as pq
 except ImportError as e:
-    raise ImportError(f"Required libraries not found: {e}")
+    raise ImportError(
+        f"Required libraries not found. "
+        f"Error type: {type(e).__name__}. "
+        f"Ensure pyspark, pandas, and pyarrow are installed."
+    )
 
 try:
     from azure.storage.filedatalake import DataLakeServiceClient, FileSystemClient, DataLakeFileClient
     from azure.core.exceptions import ResourceNotFoundError, HttpResponseError, ResourceExistsError
 except ImportError as e:
-    raise ImportError(f"Required Azure libraries not found: {e}")
+    raise ImportError(
+        f"Required Azure libraries not found. "
+        f"Error type: {type(e).__name__}. "
+        f"Ensure azure-storage-file-datalake is installed."
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +409,16 @@ class DirectADLSWriter:
             raise ValueError("Blob path must not be empty.")
         return decoded
 
+    @staticmethod
+    def _safe_path(path: str) -> str:
+        """Return a truncated path safe for logging (container + first segment only)."""
+        if not path:
+            return "<empty>"
+        parts = path.strip('/').split('/')
+        if len(parts) <= 2:
+            return path
+        return f"{parts[0]}/{parts[1]}/..."
+
     def __init__(self, adls_client: DataLakeServiceClient, spark_session: SparkSession,
                  options: Optional[Dict] = None):
         """
@@ -469,8 +491,15 @@ class DirectADLSWriter:
                 logger.info(f"Successfully wrote text files to {blob_path} (mode: {mode})")
 
         except Exception as e:
-            logger.error(f"Failed to write text files to {blob_path}: {str(e)}")
-            raise RuntimeError(f"Text file writing failed: {str(e)}")
+            logger.debug(
+                f"Full exception detail for write to {self._safe_path(blob_path)}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            raise RuntimeError(
+                f"Failed to write text file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     
     @_protect_adls_method
@@ -512,8 +541,15 @@ class DirectADLSWriter:
                 logger.info(f"Successfully wrote JSON files to {blob_path} (mode: {mode})")
 
         except Exception as e:
-            logger.error(f"Failed to write JSON files to {blob_path}: {str(e)}")
-            raise RuntimeError(f"JSON file writing failed: {str(e)}")
+            logger.debug(
+                f"Full exception detail for write to {self._safe_path(blob_path)}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            raise RuntimeError(
+                f"Failed to write JSON file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     def _write_single_json_file(self, dataframe: DataFrame, file_system_client: FileSystemClient,
                                 target_path: str, options: Dict) -> None:
@@ -652,8 +688,15 @@ class DirectADLSWriter:
                 logger.info(f"Successfully wrote CSV files to {blob_path} (mode: {mode})")
 
         except Exception as e:
-            logger.error(f"Failed to write CSV files to {blob_path}: {str(e)}")
-            raise RuntimeError(f"CSV file writing failed: {str(e)}")
+            logger.debug(
+                f"Full exception detail for write to {self._safe_path(blob_path)}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            raise RuntimeError(
+                f"Failed to write CSV file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
         
     def _write_single_csv_file(self, dataframe: DataFrame, file_system_client: FileSystemClient,
                           target_path: str, options: Dict) -> None:
@@ -792,8 +835,15 @@ class DirectADLSWriter:
                 logger.info(f"Successfully wrote binary files to {blob_path} (mode: {mode})")
                 
         except Exception as e:
-            logger.error(f"Failed to write binary files to {blob_path}: {str(e)}")
-            raise RuntimeError(f"Binary file writing failed: {str(e)}")
+            logger.debug(
+                f"Full exception detail for write to {self._safe_path(blob_path)}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            raise RuntimeError(
+                f"Failed to write binary file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     def _write_single_binary_files(self, dataframe: DataFrame, file_system_client: FileSystemClient,
                                 target_path: str, options: Dict) -> None:
@@ -984,8 +1034,15 @@ class DirectADLSWriter:
         except ImportError:
             raise RuntimeError("PyArrow required for Parquet writing: pip install pyarrow")
         except Exception as e:
-            logger.error(f"Failed to write Parquet files to {blob_path}: {str(e)}")
-            raise RuntimeError(f"Parquet file writing failed: {str(e)}")
+            logger.debug(
+                f"Full exception detail for write to {self._safe_path(blob_path)}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            raise RuntimeError(
+                f"Failed to write Parquet file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     def _write_single_parquet(self, arrow_table, file_system_client: FileSystemClient,
                               target_path: str, compression: str,
@@ -1074,8 +1131,15 @@ class DirectADLSWriter:
         except ImportError:
             raise RuntimeError("PyArrow required for ORC writing: pip install pyarrow")
         except Exception as e:
-            logger.error(f"Failed to write ORC files to {blob_path}: {str(e)}")
-            raise RuntimeError(f"ORC file writing failed: {str(e)}")
+            logger.debug(
+                f"Full exception detail for write to {self._safe_path(blob_path)}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            raise RuntimeError(
+                f"Failed to write ORC file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     @staticmethod
     def _sanitise_null_columns(arrow_table):
@@ -1167,8 +1231,15 @@ class DirectADLSWriter:
         except ImportError:
             raise RuntimeError("fastavro required for Avro writing: pip install fastavro")
         except Exception as e:
-            logger.error(f"Failed to write Avro files to {blob_path}: {str(e)}")
-            raise RuntimeError(f"Avro file writing failed: {str(e)}")
+            logger.debug(
+                f"Full exception detail for write to {self._safe_path(blob_path)}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            raise RuntimeError(
+                f"Failed to write Avro file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     @staticmethod
     def _pandas_dtype_to_avro(dtype) -> list:
@@ -1318,8 +1389,15 @@ class DirectADLSWriter:
                 logger.info(f"Successfully wrote XML files to {blob_path} (mode: {mode})")
 
         except Exception as e:
-            logger.error(f"Failed to write XML files to {blob_path}: {str(e)}")
-            raise RuntimeError(f"XML file writing failed: {str(e)}")
+            logger.debug(
+                f"Full exception detail for write to {self._safe_path(blob_path)}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            raise RuntimeError(
+                f"Failed to write XML file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     def _write_single_xml_file(self, dataframe: DataFrame,
                                file_system_client: FileSystemClient,
@@ -1436,8 +1514,15 @@ class DirectADLSWriter:
         except ValueError:
             raise  # let schema validation errors propagate without wrapping
         except Exception as e:
-            logger.error(f"Failed to write image files to {blob_path}: {str(e)}")
-            raise RuntimeError(f"Image file writing failed: {str(e)}")
+            logger.debug(
+                f"Full exception detail for write to {self._safe_path(blob_path)}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            raise RuntimeError(
+                f"Failed to write image file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     def _write_single_image_files(self, dataframe: DataFrame,
                                   file_system_client: FileSystemClient,
@@ -1523,8 +1608,15 @@ class DirectADLSWriter:
         except ImportError:
             raise RuntimeError("PyYAML required for YAML writing: pip install pyyaml")
         except Exception as e:
-            logger.error(f"Failed to write YAML files to {blob_path}: {str(e)}")
-            raise RuntimeError(f"YAML file writing failed: {str(e)}")
+            logger.debug(
+                f"Full exception detail for write to {self._safe_path(blob_path)}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            raise RuntimeError(
+                f"Failed to write YAML file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     def _write_single_yaml_file(self, dataframe: DataFrame,
                                 file_system_client: FileSystemClient,
@@ -1620,8 +1712,15 @@ class DirectADLSWriter:
         except RuntimeError:
             raise
         except Exception as e:
-            logger.error(f"Failed to write XLSX files to {blob_path}: {str(e)}")
-            raise RuntimeError(f"XLSX file writing failed: {str(e)}")
+            logger.debug(
+                f"Full exception detail for write to {self._safe_path(blob_path)}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            raise RuntimeError(
+                f"Failed to write XLSX file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     def _write_single_xlsx_file(self, dataframe: DataFrame,
                                 file_system_client: FileSystemClient,
@@ -1770,8 +1869,15 @@ class DirectADLSWriter:
         except ValueError:
             raise
         except Exception as e:
-            logger.error(f"Failed to write audio files to {blob_path}: {str(e)}")
-            raise RuntimeError(f"Audio file writing failed: {str(e)}")
+            logger.debug(
+                f"Full exception detail for write to {self._safe_path(blob_path)}: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            raise RuntimeError(
+                f"Failed to write audio file at {self._safe_path(blob_path)}. "
+                f"Error type: {type(e).__name__}. "
+                f"Enable DEBUG logging for full detail."
+            )
 
     def _write_single_audio_files(self, dataframe: DataFrame,
                                   file_system_client: FileSystemClient,
@@ -1995,7 +2101,11 @@ class DirectADLSWriter:
                     except:
                         pass  # Cleanup is best effort
                     
-                    raise RuntimeError(f"{operation_name} operation failed: {str(e)}")
+                    raise RuntimeError(
+                        f"{operation_name} operation failed. "
+                        f"Error type: {type(e).__name__}. "
+                        f"Enable DEBUG logging for full detail."
+                    )
             
             return wrapper
         return decorator
