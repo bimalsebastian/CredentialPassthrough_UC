@@ -60,7 +60,7 @@ The library does not support formats beyond those listed above. The following ca
 
 ### Formats requiring unvalidated dependencies
 
-The following formats are technically feasible but require third-party libraries that have not been validated in the GSK cluster environment. Installing unvalidated libraries on production clusters carries dependency, compatibility, and security risk that is outside the scope of this library. Domain teams working with these formats should implement their own handlers using native Spark capabilities:
+The following formats are technically feasible but require third-party libraries that have not been validated in the customer cluster environment. Installing unvalidated libraries on production clusters carries dependency, compatibility, and security risk that is outside the scope of this library. Domain teams working with these formats should implement their own handlers using native Spark capabilities:
 
 | Format category | Examples | Typical library required |
 |----------------|----------|--------------------------|
@@ -159,4 +159,4 @@ This separation keeps the library in its lane as a governance bridge and delegat
 
 ---
 
-*Last updated: v1.2.1. Maintained by the GSK Databricks Platform team.*
+*Last updated: v1.2.1. Maintained by the Customer Databricks Platform team.*
