@@ -114,14 +114,37 @@ SparkSession, DataFrame, pyspark_types = _build_pyspark_stub()
 # Patch Azure stubs and neutralise _protect_adls_method BEFORE import
 # ---------------------------------------------------------------------------
 
-sys.modules.setdefault("azure", MagicMock())
-sys.modules.setdefault("azure.storage", MagicMock())
-sys.modules.setdefault("azure.storage.filedatalake", MagicMock())
-sys.modules.setdefault("azure.core", MagicMock())
-sys.modules.setdefault("azure.core.exceptions", MagicMock())
-sys.modules.setdefault("pyarrow", MagicMock())
-sys.modules.setdefault("pyarrow.parquet", MagicMock())
-sys.modules.setdefault("pyarrow.orc", MagicMock())
+# Force-replace these mocks regardless of prior imports so that patch() resolves
+# dotted names (e.g. "pyarrow.parquet.read_table") against our mocks on all
+# Python versions. Using setdefault here is insufficient because pyarrow/azure
+# are installed packages that may already be in sys.modules by the time conftest
+# runs. In Python <3.11, patch() uses getattr() on the parent module object and
+# does NOT fall back to sys.modules["pyarrow.parquet"] if the real pyarrow
+# module doesn't expose .parquet as an attribute yet.
+_azure_mock = MagicMock()
+_azure_storage_mock = MagicMock()
+_azure_filedatalake_mock = MagicMock()
+_azure_core_mock = MagicMock()
+_azure_core_exceptions_mock = MagicMock()
+_azure_storage_mock.filedatalake = _azure_filedatalake_mock
+_azure_core_mock.exceptions = _azure_core_exceptions_mock
+_azure_mock.storage = _azure_storage_mock
+_azure_mock.core = _azure_core_mock
+
+_pyarrow_mock = MagicMock()
+_pyarrow_parquet_mock = MagicMock()
+_pyarrow_orc_mock = MagicMock()
+_pyarrow_mock.parquet = _pyarrow_parquet_mock
+_pyarrow_mock.orc = _pyarrow_orc_mock
+
+sys.modules["azure"] = _azure_mock
+sys.modules["azure.storage"] = _azure_storage_mock
+sys.modules["azure.storage.filedatalake"] = _azure_filedatalake_mock
+sys.modules["azure.core"] = _azure_core_mock
+sys.modules["azure.core.exceptions"] = _azure_core_exceptions_mock
+sys.modules["pyarrow"] = _pyarrow_mock
+sys.modules["pyarrow.parquet"] = _pyarrow_parquet_mock
+sys.modules["pyarrow.orc"] = _pyarrow_orc_mock
 sys.modules.setdefault("chardet", MagicMock())
 sys.modules.setdefault("fastavro", MagicMock())
 
