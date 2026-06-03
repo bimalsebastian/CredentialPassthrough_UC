@@ -1,11 +1,14 @@
 """Tests for DirectADLSWriter.write_image_files."""
 
+import os
 import sys
 import io
 from unittest.mock import MagicMock, patch
 
 import pytest
 import pandas as pd
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from conftest import (make_download_response, SparkSession, DataFrame,
                       pyspark_types, MockField, MockSchema)

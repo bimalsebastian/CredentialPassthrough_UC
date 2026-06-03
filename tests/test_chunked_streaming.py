@@ -1,5 +1,6 @@
 """Tests for chunked download/upload streaming and regression checks."""
 
+import os
 import sys
 import io
 import inspect
@@ -8,6 +9,8 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 import pandas as pd
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from conftest import (make_download_response, SparkSession, DataFrame,
                       pyspark_types, MockField, MockSchema)

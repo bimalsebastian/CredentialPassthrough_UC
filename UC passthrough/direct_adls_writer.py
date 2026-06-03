@@ -301,11 +301,13 @@ class WriteTransactionContext:
                     source_client = self.file_system_client.get_file_client(source_file.name)
                     dest_client = self.file_system_client.get_file_client(dest_file_path)
                     
-                    # Copy data using safe upload method
+                    # Copy data using chunked download + safe upload
                     download = source_client.download_file()
-                    data = download.readall()
-                    _adls_gen2_safe_upload(dest_client, data, True)
-            
+                    buf = io.BytesIO()
+                    for chunk in download.chunks():
+                        buf.write(chunk)
+                    _adls_gen2_safe_upload(dest_client, buf.getvalue(), True)
+
             # Delete source after successful copy
             self._delete_path(source_path)
             
@@ -334,13 +336,15 @@ class WriteTransactionContext:
                         dest_file_path = f"{dest_path}/{base_name}_{counter}{ext}"
                         counter += 1
                     
-                    # Copy file to destination using safe upload method
+                    # Copy file to destination using chunked download + safe upload
                     source_client = self.file_system_client.get_file_client(source_file.name)
                     dest_client = self.file_system_client.get_file_client(dest_file_path)
-                    
+
                     download = source_client.download_file()
-                    data = download.readall()
-                    _adls_gen2_safe_upload(dest_client, data, True)
+                    buf = io.BytesIO()
+                    for chunk in download.chunks():
+                        buf.write(chunk)
+                    _adls_gen2_safe_upload(dest_client, buf.getvalue(), True)
             
             # Delete source after successful merge
             self._delete_path(source_path)

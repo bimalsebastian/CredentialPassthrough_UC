@@ -5,12 +5,16 @@ Tests verify security invariants — no real ADLS or Spark calls are made.
 All tests are independent and use mocks where necessary.
 """
 
+import os
 import sys
 import types
 import importlib
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# Ensure the tests/ directory is on sys.path so conftest is importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Reuse the PySpark stub and Azure mocks from conftest (imported automatically by pytest).
 # conftest stubs pyspark, azure.storage.filedatalake, etc. and adds the source dir to sys.path.

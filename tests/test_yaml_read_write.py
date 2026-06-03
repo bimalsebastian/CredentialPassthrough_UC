@@ -1,5 +1,6 @@
 """Tests for YAML read and write handlers."""
 
+import os
 import sys
 import io
 import json
@@ -7,6 +8,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import pandas as pd
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from conftest import (make_download_response, SparkSession, DataFrame,
                       pyspark_types, MockField, MockSchema)
@@ -99,7 +102,7 @@ class TestReadYamlEmptyInput:
 
         reader = _make_reader(mock_adls_client, spark)
         with patch.object(reader, "_resolve_file_paths", return_value=["empty.yaml"]):
-            with pytest.raises(RuntimeError, match="No valid YAML data"):
+            with pytest.raises(RuntimeError, match="Failed to read YAML file"):
                 reader.read_yaml_files("container", "empty.yaml")
 
     def test_yaml_with_null_document_skips(self, mock_adls_client, mock_file_system_client, mock_file_client, spark):
@@ -107,7 +110,7 @@ class TestReadYamlEmptyInput:
 
         reader = _make_reader(mock_adls_client, spark)
         with patch.object(reader, "_resolve_file_paths", return_value=["null.yaml"]):
-            with pytest.raises(RuntimeError, match="No valid YAML data"):
+            with pytest.raises(RuntimeError, match="Failed to read YAML file"):
                 reader.read_yaml_files("container", "null.yaml")
 
 
