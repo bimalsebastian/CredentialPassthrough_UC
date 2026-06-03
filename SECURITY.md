@@ -24,12 +24,13 @@ The library's defence boundary is narrow and explicit: it is a **routing enforce
 | Format allowlist (write) | `SUPPORTED_WRITE_FORMATS` frozenset in `uc_passthrough_writer.py` | Same for write path; `delta` is excluded from direct ADLS writes (must go through UC governance via `saveAsTable`) |
 | Chunked stream non-logging | `DirectADLSReader` / `DirectADLSWriter` streaming paths | File content bytes are never passed to `logger.*` calls; only byte counts and path metadata are logged |
 | ADLS method caller-frame check | `_protect_adls_method` decorator in `direct_adls_writer.py` | Blocks external callers from invoking protected writer methods directly — only trusted package modules pass the frame-inspection check |
-| Exception message sanitisation | All `raise RuntimeError(...)` paths in auth and reader/writer | Error messages contain only safe path prefixes and generic failure descriptions — never tokens, full paths, or config values |
+| Exception message sanitisation | All `raise RuntimeError(...)` paths in auth and reader/writer | Error messages contain only exception type and safe path prefix. Full Azure SDK exception detail (which may include storage account URLs, container names, or request IDs) is captured at DEBUG log level only. Fixed in v1.2.0 — previously partially implemented. |
 
 ## Known limitations
 
 - **Cluster admin bypass.** A user with cluster admin rights (or access to the cluster's environment variables / init scripts) can read `PASSTHROUGH_CLIENT_SECRET` and acquire tokens directly using MSAL, completely outside this library.
-- **Decompilation.** Name mangling is obfuscation, not encryption. A user who decompiles the library `.whl` (or reads the source on a shared volume) can find `_AuthenticationManager__client_secret` and access it via the mangled name.
+- **Name-mangling is not a secret.** Python's name-mangling convention (`_ClassName__attr`) is documented in the language specification and taught in introductory courses. A user does not need to decompile anything — `mgr._AuthenticationManager__token_cache` is directly accessible to anyone who knows the class name. Name mangling prevents accidental access, not deliberate access.
+- **`_protect_adls_method` is a no-op in notebook contexts.** The frame-inspection decorator trusts `__main__` as a calling module. In Databricks, every notebook runs as `__main__`. This means the decorator does not prevent notebook users from calling protected writer methods directly. It provides protection only against calls from unrelated Python modules. This is documented here for transparency — do not rely on this control as a security boundary.
 - **Out-of-library client instantiation.** Nothing prevents a user from calling `DataLakeServiceClient(account_url, credential=...)` themselves if they already hold a valid credential or manage to extract one.
 - **No runtime integrity verification.** The library does not verify its own bytecode or module hash at load time. A sophisticated attacker could patch `sys.modules` entries before the library is imported.
 - **UC governance is authoritative.** This library routes traffic to UC — it does not replicate UC's permission model. If UC permissions are misconfigured, the library will faithfully send the request through and UC will grant it.
@@ -62,4 +63,12 @@ The library uses the following third-party packages beyond the Databricks Runtim
 | `chardet` | Character encoding detection for text files | Community-maintained; pin exact version |
 | `pandas` | DataFrame conversion between Spark and Python-native formats | NumFOCUS-governed; pin to major version |
 
-**Recommendation:** Generate a `requirements.txt` with hash-pinned versions (`--require-hashes`) and verify against a known-good lockfile in CI. Consider vendoring `fastavro`, `openpyxl`, `mutagen`, and `chardet` if the deployment environment supports it, as these are the least-governed packages in the dependency tree.
+**Status: not yet implemented.** Hash-pinned dependency installation has not been applied to this repository. The recommendation stands — generate a `requirements.txt` with `--require-hashes` and verify against a known-good lockfile in CI — but until this is implemented it should be treated as a documented gap, not an active control. The GSK platform team should implement hash pinning as part of cluster onboarding before production deployment.
+
+## Revision history
+
+| Version | Change |
+|---------|--------|
+| v1.2.0 | Corrected exception sanitisation coverage — raw Azure SDK exceptions now captured at DEBUG only. Updated known limitations: name-mangling triviality, `__main__` frame-check no-op in notebooks, hash-pinning status changed from recommendation to documented gap. |
+| v1.1.0 | Initial security hardening release — __slots__, path traversal validation, format allowlists, repr sanitisation, options scrubbing. |
+| v1.0.0 | No formal security controls documented. |
