@@ -159,4 +159,4 @@ This separation keeps the library in its lane as a governance bridge and delegat
 
 ---
 
-*Last updated: v1.2.1. Maintained by the Customer Databricks Platform team.*
+

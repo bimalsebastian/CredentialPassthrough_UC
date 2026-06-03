@@ -64,7 +64,7 @@ The library uses the following third-party packages beyond the Databricks Runtim
 | `chardet` | Character encoding detection for text files | Community-maintained; pin exact version |
 | `pandas` | DataFrame conversion between Spark and Python-native formats | NumFOCUS-governed; pin to major version |
 
-**Status: not yet implemented.** Hash-pinned dependency installation has not been applied to this repository. The recommendation stands — generate a `requirements.txt` with `--require-hashes` and verify against a known-good lockfile in CI — but until this is implemented it should be treated as a documented gap, not an active control. The customer platform team should implement hash pinning as part of cluster onboarding before production deployment.
+**Status: not yet implemented.** Hash-pinned dependency installation has not been applied to this repository. The recommendation stands — generate a `requirements.txt` with `--require-hashes` and verify against a known-good lockfile in CI — but until this is implemented it should be treated as a documented gap, not an active control. The platform team should implement hash pinning as part of cluster onboarding before production deployment.
 
 ## Revision history
 
