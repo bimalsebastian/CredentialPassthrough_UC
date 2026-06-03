@@ -6,6 +6,9 @@ then converts the data to Spark DataFrames without requiring Spark-level token i
 
 Required dependency: PyYAML (available in standard Databricks Runtime)
     pip install pyyaml
+
+Required dependency: openpyxl (NOT included in Databricks Runtime by default —
+    must be installed on the cluster via init script or %pip install openpyxl)
 """
 
 import io
@@ -619,6 +622,143 @@ class DirectADLSReader:
                 result[flat_key] = value
 
         return result
+
+    def read_xlsx_files(self, container: str, blob_path: str,
+                        options: Optional[Dict] = None) -> DataFrame:
+        """
+        Read Excel (.xlsx) files from ADLS and return a Spark DataFrame.
+
+        Downloads file bytes into a BytesIO buffer, opens with openpyxl in read-only
+        mode, reads the active sheet (or a named sheet via the 'sheet_name' option),
+        handles merged cells by forward-filling, and strips whitespace from strings.
+
+        Args:
+            container: ADLS container name
+            blob_path: Path to file(s) - supports wildcards
+            options: Reading options. Supported keys:
+                     - sheet_name: name of the worksheet to read (default: active sheet)
+                     - header: whether first row is a header (default: True)
+
+        Returns:
+            Spark DataFrame with the spreadsheet contents
+        """
+        try:
+            import openpyxl
+        except ImportError:
+            raise RuntimeError(
+                "openpyxl is required for XLSX support. "
+                "Install it with: %pip install openpyxl"
+            )
+
+        try:
+            opts = options or {}
+            sheet_name = opts.get('sheet_name') or opts.get('sheetName')
+            header = opts.get('header', True)
+
+            file_system_client = self.adls_client.get_file_system_client(container)
+            file_paths = self._resolve_file_paths(file_system_client, blob_path)
+
+            if len(file_paths) > self.max_files_per_read:
+                logger.warning(f"Found {len(file_paths)} files, "
+                               f"limiting to {self.max_files_per_read}")
+                file_paths = file_paths[:self.max_files_per_read]
+
+            all_dataframes = []
+
+            for file_path in file_paths:
+                try:
+                    file_client = file_system_client.get_file_client(file_path)
+                    properties = file_client.get_file_properties()
+
+                    file_size_mb = properties.size / (1024 * 1024)
+                    if file_size_mb > self.max_file_size_mb:
+                        logger.warning(f"Skipping large file {file_path} "
+                                       f"({file_size_mb:.1f} MB)")
+                        continue
+
+                    content_bytes = file_client.download_file().readall()
+                    wb = openpyxl.load_workbook(
+                        io.BytesIO(content_bytes), read_only=True, data_only=True
+                    )
+
+                    # Select the target worksheet
+                    if sheet_name:
+                        if sheet_name not in wb.sheetnames:
+                            logger.warning(
+                                f"Sheet '{sheet_name}' not found in {file_path}, "
+                                f"available: {wb.sheetnames}. Skipping."
+                            )
+                            wb.close()
+                            continue
+                        ws = wb[sheet_name]
+                    else:
+                        ws = wb.active
+
+                    # Read all rows into a list of lists
+                    rows = []
+                    for row in ws.iter_rows(values_only=True):
+                        rows.append(list(row))
+                    wb.close()
+
+                    if not rows:
+                        logger.warning(f"Empty worksheet in {file_path}, skipping")
+                        continue
+
+                    # Handle merged cells by forward-filling None values
+                    rows = self._forward_fill_merged_cells(rows)
+
+                    # Build pandas DataFrame
+                    if header and len(rows) > 1:
+                        columns = [
+                            str(c).strip() if c is not None else f"_col{i}"
+                            for i, c in enumerate(rows[0])
+                        ]
+                        pdf = pd.DataFrame(rows[1:], columns=columns)
+                    else:
+                        pdf = pd.DataFrame(rows)
+
+                    # Strip whitespace from string columns
+                    for col in pdf.select_dtypes(include=['object']).columns:
+                        pdf[col] = pdf[col].apply(
+                            lambda v: v.strip() if isinstance(v, str) else v
+                        )
+
+                    pdf['_file_path'] = (
+                        f"abfss://{container}@"
+                        f"{self.adls_client.account_name}"
+                        f".dfs.core.windows.net/{file_path}"
+                    )
+                    all_dataframes.append(pdf)
+
+                except Exception as e:
+                    logger.warning(f"Failed to read XLSX file {file_path}: {e}")
+                    continue
+
+            if not all_dataframes:
+                raise RuntimeError(f"No valid XLSX data found in {blob_path}")
+
+            combined = pd.concat(all_dataframes, ignore_index=True)
+            return self.spark.createDataFrame(combined)
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to read XLSX files from {blob_path}: {e}")
+            raise RuntimeError(f"XLSX file reading failed: {e}")
+
+    @staticmethod
+    def _forward_fill_merged_cells(rows: List[list]) -> List[list]:
+        """
+        Forward-fill None values across columns to handle merged cell ranges.
+        A None that follows a non-None value in the same row is filled with
+        the preceding value — this matches openpyxl's read_only behaviour where
+        merged cells report None for all but the top-left cell.
+        """
+        for row in rows:
+            for i in range(1, len(row)):
+                if row[i] is None and row[i - 1] is not None:
+                    row[i] = row[i - 1]
+        return rows
 
     def read_binary_files(self, container: str, blob_path: str,
                         options: Optional[Dict] = None) -> DataFrame:

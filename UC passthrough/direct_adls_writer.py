@@ -12,6 +12,9 @@ UPDATED: Modified to preserve original filenames instead of generating new ones.
 
 Required dependency: PyYAML (available in standard Databricks Runtime)
     pip install pyyaml
+
+Required dependency: openpyxl (NOT included in Databricks Runtime by default —
+    must be installed on the cluster via init script or %pip install openpyxl)
 """
 
 import io
@@ -1525,6 +1528,144 @@ class DirectADLSWriter:
             _adls_gen2_safe_upload(file_client, yaml_content, True)
             logger.debug(f"Wrote partitioned YAML: {file_path}")
 
+    @_protect_adls_method
+    def write_xlsx_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                         mode: str = 'error', partition_columns: List[str] = None,
+                         options: Optional[Dict] = None) -> None:
+        """
+        Write DataFrame as an Excel (.xlsx) file directly to ADLS using openpyxl.
+
+        Creates a workbook with headers in bold on row 1 and data from row 2 onwards.
+        Supports an optional sheet_name option (default: "Sheet1").
+
+        Args:
+            dataframe: DataFrame to write
+            container: ADLS container name
+            blob_path: Target path for the XLSX file
+            mode: Write mode ('overwrite', 'append', 'ignore', 'error')
+            partition_columns: Optional partition columns
+            options: Additional writing options (sheet_name, etc.)
+        """
+        try:
+            import openpyxl
+        except ImportError:
+            raise RuntimeError(
+                "openpyxl is required for XLSX support. "
+                "Install it with: %pip install openpyxl"
+            )
+
+        try:
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+
+                    if partition_columns:
+                        self._write_partitioned_xlsx_files(
+                            dataframe, file_system_client, write_path,
+                            partition_columns, safe_options)
+                    else:
+                        self._write_single_xlsx_file(
+                            dataframe, file_system_client, write_path, safe_options)
+
+                logger.info(f"Successfully wrote XLSX files to {blob_path} (mode: {mode})")
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to write XLSX files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"XLSX file writing failed: {str(e)}")
+
+    def _write_single_xlsx_file(self, dataframe: DataFrame,
+                                file_system_client: FileSystemClient,
+                                target_path: str, options: Dict) -> None:
+        """Serialise DataFrame to an Excel workbook and upload to ADLS."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+
+        sheet_name = options.get('sheet_name') or options.get('sheetName') or 'Sheet1'
+        pandas_df = dataframe.toPandas()
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = sheet_name
+
+        # Write header row with bold formatting
+        bold_font = Font(bold=True)
+        for col_idx, col_name in enumerate(pandas_df.columns, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=str(col_name))
+            cell.font = bold_font
+
+        # Write data rows starting at row 2
+        for row_idx, row in enumerate(pandas_df.itertuples(index=False), start=2):
+            for col_idx, value in enumerate(row, start=1):
+                # Convert numpy/pandas types to native Python for openpyxl
+                if pd.isna(value):
+                    ws.cell(row=row_idx, column=col_idx, value=None)
+                else:
+                    ws.cell(row=row_idx, column=col_idx, value=value)
+
+        # Serialise to bytes buffer
+        buf = io.BytesIO()
+        wb.save(buf)
+        wb.close()
+        xlsx_bytes = buf.getvalue()
+
+        file_client = file_system_client.get_file_client(target_path)
+        _adls_gen2_safe_upload(file_client, xlsx_bytes, True)
+        logger.debug(f"Wrote XLSX file: {target_path} ({len(xlsx_bytes)} bytes)")
+
+    def _write_partitioned_xlsx_files(self, dataframe: DataFrame,
+                                      file_system_client: FileSystemClient,
+                                      target_path: str, partition_columns: List[str],
+                                      options: Dict) -> None:
+        """Write DataFrame as partitioned XLSX files using Hive-style directory layout."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+
+        sheet_name = options.get('sheet_name') or options.get('sheetName') or 'Sheet1'
+        pandas_df = dataframe.toPandas()
+        grouped = pandas_df.groupby(partition_columns)
+
+        for partition_values, group_df in grouped:
+            if len(partition_columns) == 1:
+                partition_values = [partition_values]
+            partition_dir = "/".join(
+                f"{col}={val}" for col, val in zip(partition_columns, partition_values)
+            )
+            output_df = group_df.drop(columns=partition_columns)
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = sheet_name
+
+            bold_font = Font(bold=True)
+            for col_idx, col_name in enumerate(output_df.columns, start=1):
+                cell = ws.cell(row=1, column=col_idx, value=str(col_name))
+                cell.font = bold_font
+
+            for row_idx, row in enumerate(output_df.itertuples(index=False), start=2):
+                for col_idx, value in enumerate(row, start=1):
+                    if pd.isna(value):
+                        ws.cell(row=row_idx, column=col_idx, value=None)
+                    else:
+                        ws.cell(row=row_idx, column=col_idx, value=value)
+
+            buf = io.BytesIO()
+            wb.save(buf)
+            wb.close()
+
+            file_path = f"{target_path}/{partition_dir}/part-00000.xlsx"
+            file_client = file_system_client.get_file_client(file_path)
+            _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
+            logger.debug(f"Wrote partitioned XLSX: {file_path}")
+
     def validate_dataframe_for_format(self, dataframe: DataFrame, format_type: str) -> List[str]:
         """
         Validate DataFrame schema compatibility with target format.
@@ -1602,7 +1743,7 @@ class DirectADLSWriter:
 
     def get_supported_write_operations(self) -> List[str]:
         """Return the list of supported write format operations."""
-        return ['csv', 'json', 'yaml', 'text', 'binaryfile', 'image', 'parquet', 'orc', 'avro', 'xml']
+        return ['csv', 'json', 'yaml', 'xlsx', 'text', 'binaryfile', 'image', 'parquet', 'orc', 'avro', 'xml']
 
     def get_supported_write_modes(self) -> List[str]:
         """Return the list of supported write modes."""
