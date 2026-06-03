@@ -4,16 +4,20 @@ A secure credential passthrough solution for Databricks Unity Catalog clusters t
 
 ## Overview
 
-This library solves the challenge of accessing unstructured files (CSV, JSON, images, text files) from Unity Catalog clusters by intelligently routing data access:
+This library solves the challenge of accessing file-based data from Unity Catalog clusters by intelligently routing data access:
 
-- **Structured data** (Delta, Parquet) → Unity Catalog governance
-- **Unstructured data** (CSV, JSON, text, binary) → Direct ADLS access with user credentials
+- **Structured data** (Delta, Iceberg) → Unity Catalog governance — always, by design
+- **Unstructured / file-based data** (Parquet, ORC, Avro, CSV, JSON, JSONL, TSV, Text, XML, Binary, Image, YAML, XLSX, Audio) → Direct ADLS access with user credentials, via chunked streaming
+
+See [FORMAT_SCOPE.md](./FORMAT_SCOPE.md) for the full read/write matrix.
 
 ## Key Features
 
 - **Intelligent Path Routing**: Automatically determines whether to use UC governance or direct ADLS access
 - **Secure Authentication**: Maintains user identity and audit trails
-- **Token Caching**: Optimized performance with secure token management  
+- **Token Caching**: Optimized performance with secure token management
+- **Chunked Streaming**: Large file support for reads and writes via configurable chunk size — removes the previous 100MB read and 2.25GB write ceilings
+- **Format Handlers**: Native read and write support for 14 file formats without requiring Spark format drivers or JARs
 - **Thread-Safe Operations**: Production-ready with proper concurrency handling
 - **Flexible Configuration**: Environment variables and runtime configuration support
 
@@ -21,8 +25,12 @@ This library solves the challenge of accessing unstructured files (CSV, JSON, im
 
 ```python
 # Install required dependencies
-pip install msal azure-storage-file-datalake azure-identity pandas chardet fastavro
+pip install msal azure-storage-file-datalake azure-identity \
+            pandas pyarrow fastavro chardet \
+            openpyxl PyYAML
 ```
+
+> **Optional dependency:** `mutagen` is required only if using audio_mode='metadata' for audio files. Install separately with `pip install mutagen` if needed. Raw audio file access (audio_mode='binary', the default) requires no additional packages.
 
 ## Quick Start
 
@@ -289,25 +297,47 @@ User Request
      ↓
 UCPassthroughDataFrameReader
      ↓
-PathAnalyzer (Route Decision)
+PathAnalyzer + Format Allowlist Validation
      ↓
-┌─────────────────────┬─────────────────────┐
-│   Unity Catalog     │    Direct ADLS      │
-│   (Structured)      │   (Unstructured)    │
-│                     │                     │
-│ - Delta tables      │ - CSV files         │
-│ - Parquet files     │ - JSON files        │
-│ - Volume paths      │ - Text files        │
-│ - Table references  │ - Binary files      │
-└─────────────────────┴─────────────────────┘
+┌─────────────────────────┬──────────────────────────────────────┐
+│    Unity Catalog        │         Direct ADLS                  │
+│    (always routed)      │   (chunked streaming, user creds)    │
+│                         │                                      │
+│  Delta, Iceberg         │  Parquet, ORC, Avro                  │
+│  Volume paths           │  CSV, JSON, JSONL, TSV               │
+│  Table references       │  Text, XML, Binary, Image            │
+│                         │  YAML, XLSX, Audio                   │
+└─────────────────────────┴──────────────────────────────────────┘
+```
+
+## Format-specific options
+
+```python
+# XLSX — read a specific sheet (default: active sheet)
+df = spark_passthrough.read.format('xlsx') \
+    .option('sheet_name', 'Q3 Results') \
+    .load('abfss://container@storage/reports/quarterly.xlsx')
+
+# Audio — raw binary access (default, no extra dependencies)
+df = spark_passthrough.read.format('audio') \
+    .load('abfss://container@storage/recordings/call.wav')
+
+# Audio — metadata DataFrame (requires mutagen)
+df = spark_passthrough.read.format('audio') \
+    .option('audio_mode', 'metadata') \
+    .load('abfss://container@storage/recordings/call.wav')
+
+# Chunked streaming — override default 4MB chunk size for large files
+df = spark_passthrough.read.format('parquet') \
+    .option('adls_chunk_size_bytes', 16 * 1024 * 1024) \
+    .load('abfss://container@storage/large/file.parquet')
 ```
 
 ## Security Considerations
 
-- **User Identity Preservation**: All operations maintain the original user's identity for audit trails
-- **Token Protection**: Access tokens are stored in protected, private variables
-- **Permission Validation**: User's ADLS RBAC permissions are validated at runtime  
-- **Secure Configuration**: Sensitive configuration is isolated from user code manipulation
+Security controls, threat model, known limitations, and dependency pinning guidance are documented in [SECURITY.md](./SECURITY.md).
+
+In brief: credentials are name-mangled and never appear in logs or repr output. Paths are validated against traversal attacks before any ADLS operation. Format strings are validated against an allowlist. The library is a routing enforcer — Unity Catalog cluster governance (workspace permissions, IP ACLs, cluster policies) is the authoritative security boundary.
 
 ## Troubleshooting
 
@@ -351,10 +381,19 @@ print(result)
 
 ## Limitations
 
-- Maximum 1000 files per read operation (configurable)
-- Maximum 100MB per individual file (configurable)
-- Requires Unity Catalog cluster with proper network connectivity
-- Service Principal requires appropriate Azure AD and ADLS permissions
+For full detail on format coverage, unsupported formats, file size behaviour, and ML workload constraints, see [FORMAT_SCOPE.md](./FORMAT_SCOPE.md).
+
+**File size**
+Reads and writes use chunked streaming via the Azure SDK. There is no hard ceiling imposed by the library. Practical limits are determined by executor memory and ADLS account configuration.
+
+**Format scope**
+14 formats are supported natively. Formats outside this set are not handled by the library — see FORMAT_SCOPE.md for the complete list and guidance for domain teams working with unsupported formats.
+
+**Delta and Iceberg**
+Delta and Iceberg are always routed through Unity Catalog. Raw abfss:// Delta writes are deliberately blocked — use saveAsTable() instead. This is by design, not a limitation.
+
+**UC governance is authoritative**
+This library is a routing enforcer. If UC permissions are misconfigured, the library will faithfully route the request and UC will grant or deny it. The library does not replicate or shadow UC's permission model.
 
 ## Contributing
 
