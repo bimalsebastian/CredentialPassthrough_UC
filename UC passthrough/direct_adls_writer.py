@@ -378,12 +378,25 @@ class DirectADLSWriter:
     """
     Writes data directly to ADLS using Python SDK with user credentials.
     Provides transaction safety and rollback capabilities for write operations.
-    
+
     All authentication mechanisms and ADLS client access is protected from user manipulation.
     UPDATED: Uses correct ADLS Gen2 API sequence to avoid x-ms-blob-type header issues.
     UPDATED: Modified to preserve original filenames instead of generating new ones.
     """
-    
+
+    @staticmethod
+    def _validate_blob_path(blob_path: str) -> str:
+        """Validate a blob path component for traversal and injection attacks."""
+        from urllib.parse import unquote
+        decoded = unquote(blob_path)
+        if '..' in decoded:
+            raise ValueError("Path traversal sequences ('..') are not permitted in blob paths.")
+        if '\x00' in decoded:
+            raise ValueError("Null bytes are not permitted in blob paths.")
+        if not decoded or not decoded.strip():
+            raise ValueError("Blob path must not be empty.")
+        return decoded
+
     def __init__(self, adls_client: DataLakeServiceClient, spark_session: SparkSession,
                  options: Optional[Dict] = None):
         """
@@ -423,7 +436,7 @@ class DirectADLSWriter:
         """
         Protected method to write text files directly to ADLS.
         This method is protected from direct user access.
-        
+
         Args:
             dataframe: DataFrame to write
             container: ADLS container name
@@ -432,6 +445,7 @@ class DirectADLSWriter:
             partition_columns: Optional partition columns
             options: Additional writing options
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             with self.__lock:
                 file_system_client = self.__adls_client.get_file_system_client(container)
@@ -475,6 +489,7 @@ class DirectADLSWriter:
             partition_columns: Optional partition columns
             options: Additional writing options
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             with self.__lock:
                 file_system_client = self.__adls_client.get_file_system_client(container)
@@ -614,6 +629,7 @@ class DirectADLSWriter:
             partition_columns: Optional partition columns
             options: Additional writing options
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             with self.__lock:
                 file_system_client = self.__adls_client.get_file_system_client(container)
@@ -735,7 +751,7 @@ class DirectADLSWriter:
         Protected method to write binary files directly to ADLS.
         Expected DataFrame schema: path (string), content (binary)
         This method is protected from direct user access.
-        
+
         Args:
             dataframe: DataFrame to write (must have 'path' and 'content' columns)
             container: ADLS container name
@@ -744,6 +760,7 @@ class DirectADLSWriter:
             partition_columns: Optional partition columns
             options: Additional writing options
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             # Validate DataFrame schema for binary files
             required_columns = ['path', 'content']
@@ -932,6 +949,7 @@ class DirectADLSWriter:
           compression  - 'snappy' (default), 'gzip', 'brotli', 'zstd', 'none'
           row_group_size - rows per row group
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
@@ -1023,6 +1041,7 @@ class DirectADLSWriter:
         Supports:
           compression - 'zlib' (default), 'snappy', 'lz4', 'zstd', 'none'
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             import pyarrow as pa
             import pyarrow.orc as orc
@@ -1117,6 +1136,7 @@ class DirectADLSWriter:
         Supports:
           codec - 'null' (default), 'deflate', 'snappy', 'bzip2'
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             import fastavro
 
@@ -1273,6 +1293,7 @@ class DirectADLSWriter:
           rowTag   - name of the element wrapping each row (default: 'row')
           encoding - character encoding (default: 'utf-8')
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             import xml.etree.ElementTree as ET
 
@@ -1373,6 +1394,7 @@ class DirectADLSWriter:
             partition_columns: Optional partition columns
             options: Additional writing options
         """
+        blob_path = self._validate_blob_path(blob_path)
         SUPPORTED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'tiff', 'bmp', 'gif'}
 
         try:
@@ -1473,6 +1495,7 @@ class DirectADLSWriter:
             partition_columns: Optional partition columns
             options: Additional writing options
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             import yaml
 
@@ -1563,6 +1586,7 @@ class DirectADLSWriter:
             partition_columns: Optional partition columns
             options: Additional writing options (sheet_name, etc.)
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             import openpyxl
         except ImportError:
@@ -1707,6 +1731,7 @@ class DirectADLSWriter:
             partition_columns: Optional partition columns
             options: Additional writing options
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             # Validate schema — content column must exist and be BinaryType
             schema_fields = {f.name: f.dataType for f in dataframe.schema.fields}

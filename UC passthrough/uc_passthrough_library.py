@@ -38,6 +38,12 @@ from .uc_passthrough_writer import UCPassthroughWriterProxy, _UCWriteDataFrame
 
 logger = logging.getLogger(__name__)
 
+SUPPORTED_READ_FORMATS = frozenset({
+    'parquet', 'orc', 'avro', 'csv', 'json', 'jsonl', 'tsv',
+    'text', 'xml', 'binaryfile', 'binary', 'image',
+    'wav', 'mp3', 'audio', 'yaml', 'yml', 'xlsx', 'delta'
+})
+
 
 class UCPassthroughFormatReader:
     """
@@ -222,6 +228,7 @@ class UCPassthroughFormatReader:
         if not self.__auth_manager.is_authenticated():
             raise RuntimeError("User not authenticated. Call auth_manager.initialize_user_context() first.")
 
+        path = PathAnalyzer.validate_and_normalise_path(path)
         storage_account_url, container, blob_path = self._parse_adls_path(path)
         adls_client = self.__auth_manager.get_adls_client(storage_account_url)
 
@@ -527,6 +534,12 @@ class UCPassthroughReaderProxy:
         )
 
     def format(self, source: str) -> 'UCPassthroughReaderProxy':
+        fmt = source.lower()
+        if fmt not in SUPPORTED_READ_FORMATS:
+            raise ValueError(
+                f"Format '{source}' is not supported. "
+                f"Supported formats: {sorted(SUPPORTED_READ_FORMATS)}"
+            )
         self._reader.format_type = source
         return self
 

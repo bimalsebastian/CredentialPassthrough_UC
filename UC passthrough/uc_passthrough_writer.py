@@ -35,6 +35,11 @@ from .authentication_manager import AuthenticationManager
 
 logger = logging.getLogger(__name__)
 
+SUPPORTED_WRITE_FORMATS = frozenset({
+    'parquet', 'orc', 'avro', 'csv', 'json', 'text', 'xml',
+    'binaryfile', 'image', 'wav', 'mp3', 'audio', 'yaml', 'yml', 'xlsx'
+})
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 #  UCPassthroughFormatWriter
@@ -239,6 +244,7 @@ class UCPassthroughFormatWriter:
                 "User not authenticated. Call auth_manager.initialize_user_context() first."
             )
 
+        path = PathAnalyzer.validate_and_normalise_path(path)
         storage_account_url, container, blob_path = self._parse_adls_path(path)
         adls_client = self._auth_manager.get_adls_client(storage_account_url)
 
@@ -362,6 +368,12 @@ class UCPassthroughWriterProxy:
         )
 
     def format(self, source: str) -> 'UCPassthroughWriterProxy':
+        fmt = source.lower()
+        if fmt not in SUPPORTED_WRITE_FORMATS:
+            raise ValueError(
+                f"Format '{source}' is not supported for writing. "
+                f"Supported formats: {sorted(SUPPORTED_WRITE_FORMATS)}"
+            )
         self._writer._format_type = source
         return self
 

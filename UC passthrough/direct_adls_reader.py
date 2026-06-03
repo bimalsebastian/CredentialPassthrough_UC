@@ -49,7 +49,20 @@ class DirectADLSReader:
     Reads unstructured files directly from ADLS using Python SDK, then converts to Spark DataFrames.
     This bypasses the need for Spark-level credential injection.
     """
-    
+
+    @staticmethod
+    def _validate_blob_path(blob_path: str) -> str:
+        """Validate a blob path component for traversal and injection attacks."""
+        from urllib.parse import unquote
+        decoded = unquote(blob_path)
+        if '..' in decoded:
+            raise ValueError("Path traversal sequences ('..') are not permitted in blob paths.")
+        if '\x00' in decoded:
+            raise ValueError("Null bytes are not permitted in blob paths.")
+        if not decoded or not decoded.strip():
+            raise ValueError("Blob path must not be empty.")
+        return decoded
+
     def __init__(self, adls_client: DataLakeServiceClient, spark_session: SparkSession,
                  options: Optional[Dict] = None):
         """
@@ -75,21 +88,22 @@ class DirectADLSReader:
         buffer.seek(0)
         return buffer.read()
 
-    def read_text_files(self, container: str, blob_path: str, 
+    def read_text_files(self, container: str, blob_path: str,
                        encoding: Optional[str] = None,
                        options: Optional[Dict] = None) -> DataFrame:
         """
         Read text files directly from ADLS and convert to Spark DataFrame.
-        
+
         Args:
             container: ADLS container name
             blob_path: Path to file(s) - supports wildcards
             encoding: File encoding (auto-detected if None)
             options: Additional reading options
-            
+
         Returns:
             Spark DataFrame with text content
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             files_data = []
             file_system_client = self.adls_client.get_file_system_client(container)
@@ -154,15 +168,16 @@ class DirectADLSReader:
                          options: Optional[Dict] = None) -> DataFrame:
         """
         Read binary files directly from ADLS and convert to Spark DataFrame.
-        
+
         Args:
-            container: ADLS container name  
+            container: ADLS container name
             blob_path: Path to file(s) - supports wildcards
             options: Additional reading options
-            
+
         Returns:
             Spark DataFrame with binary content (similar to Spark's binaryFile format)
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             files_data = []
             file_system_client = self.adls_client.get_file_system_client(container)
@@ -216,15 +231,16 @@ class DirectADLSReader:
                        options: Optional[Dict] = None) -> DataFrame:
         """
         Read JSON files directly from ADLS and convert to Spark DataFrame.
-        
+
         Args:
             container: ADLS container name
-            blob_path: Path to file(s) - supports wildcards  
+            blob_path: Path to file(s) - supports wildcards
             options: Additional reading options (multiLine, etc.)
-            
+
         Returns:
             Spark DataFrame with JSON data
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             all_json_data = []
             file_system_client = self.adls_client.get_file_system_client(container)
@@ -289,15 +305,16 @@ class DirectADLSReader:
                       options: Optional[Dict] = None) -> DataFrame:
         """
         Read CSV files directly from ADLS and convert to Spark DataFrame.
-        
+
         Args:
             container: ADLS container name
             blob_path: Path to file(s) - supports wildcards
             options: CSV reading options (header, sep, etc.)
-            
+
         Returns:
             Spark DataFrame with CSV data
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             all_csv_data = []
             file_system_client = self.adls_client.get_file_system_client(container)
@@ -360,6 +377,7 @@ class DirectADLSReader:
     def read_parquet_files(self, container: str, blob_path: str,
                         options: Optional[Dict] = None) -> DataFrame:
         """Read parquet files via PyArrow — no Spark ABFS driver involved."""
+        blob_path = self._validate_blob_path(blob_path)
         try:
             import pyarrow.parquet as pq
             import pyarrow as pa
@@ -391,6 +409,7 @@ class DirectADLSReader:
     def read_orc_files(self, container: str, blob_path: str,
                     options: Optional[Dict] = None) -> DataFrame:
         """Read ORC files via PyArrow — no Spark ABFS driver involved."""
+        blob_path = self._validate_blob_path(blob_path)
         try:
             import pyarrow.orc as orc
             import io
@@ -424,6 +443,7 @@ class DirectADLSReader:
     def read_avro_files(self, container: str, blob_path: str,
                         options: Optional[Dict] = None) -> DataFrame:
         """Read Avro files via fastavro — no Spark ABFS driver involved."""
+        blob_path = self._validate_blob_path(blob_path)
         try:
             import fastavro
             import io
@@ -464,11 +484,12 @@ class DirectADLSReader:
                     options: Optional[Dict] = None) -> DataFrame:
         """
         Read XML files via xml.etree — no Spark ABFS driver involved.
-        Requires 'rowTag' option to identify the repeating element, 
+        Requires 'rowTag' option to identify the repeating element,
         matching Spark's spark-xml behaviour.
-        
+
         Example: options={'rowTag': 'person'}
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             import xml.etree.ElementTree as ET
             import pandas as pd
@@ -544,6 +565,7 @@ class DirectADLSReader:
         Returns:
             Spark DataFrame with flattened YAML content
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             import yaml
 
@@ -651,6 +673,7 @@ class DirectADLSReader:
         Returns:
             Spark DataFrame with the spreadsheet contents
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             import openpyxl
         except ImportError:
@@ -796,6 +819,7 @@ class DirectADLSReader:
         Returns:
             Spark DataFrame (schema depends on audio_mode)
         """
+        blob_path = self._validate_blob_path(blob_path)
         opts = options or {}
         audio_mode = opts.get('audio_mode', 'binary').lower()
 
@@ -951,6 +975,7 @@ class DirectADLSReader:
         Read binary files and return a DataFrame matching Spark's binaryFile schema:
             path, modificationTime, length, content (bytes)
         """
+        blob_path = self._validate_blob_path(blob_path)
         try:
             from pyspark.sql.types import (StructType, StructField, StringType,
                                         BinaryType, LongType, TimestampType)

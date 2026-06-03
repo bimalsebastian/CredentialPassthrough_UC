@@ -23,7 +23,36 @@ class PathAnalyzer:
     - UC objects (schemas, tables, volumes) -> Unity Catalog governance
     - Direct paths not tied to UC objects -> Direct ADLS access with user credentials
     """
-    
+
+    @staticmethod
+    def validate_and_normalise_path(path: str) -> str:
+        """
+        Validates an abfss:// path for safety before any ADLS operation.
+        Raises ValueError with a clear message if the path fails validation.
+        """
+        if not path.startswith('abfss://'):
+            raise ValueError(f"Path must use abfss:// scheme. Got: {path[:20]}...")
+
+        # Decode any percent-encoded characters before checking
+        from urllib.parse import unquote
+        decoded = unquote(path)
+
+        # Reject path traversal sequences
+        if '..' in decoded:
+            raise ValueError("Path traversal sequences ('..') are not permitted in ADLS paths.")
+
+        # Reject null bytes
+        if '\x00' in decoded:
+            raise ValueError("Null bytes are not permitted in ADLS paths.")
+
+        # Reject paths that are purely the container root with no blob path
+        # (prevents accidental full-container operations)
+        parsed_path = decoded.split('/', 3)
+        if len(parsed_path) < 4 or not parsed_path[3].strip():
+            raise ValueError("Path must include a blob path within the container, not just the container root.")
+
+        return decoded
+
     # Unity Catalog object patterns
     UC_VOLUME_PATTERN = r'^/[Vv]olumes/[^/]+/[^/]+/[^/]+(/.*)?$'
     UC_CATALOG_TABLE_PATTERN = r'^[a-zA-Z][a-zA-Z0-9_]*\.[a-zA-Z][a-zA-Z0-9_]*\.[a-zA-Z][a-zA-Z0-9_]*$'
