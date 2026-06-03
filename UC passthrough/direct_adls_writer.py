@@ -15,6 +15,8 @@ Required dependency: PyYAML (available in standard Databricks Runtime)
 
 Required dependency: openpyxl (NOT included in Databricks Runtime by default —
     must be installed on the cluster via init script or %pip install openpyxl)
+
+Audio format write: no additional dependencies (binary passthrough only).
 """
 
 import io
@@ -1666,6 +1668,105 @@ class DirectADLSWriter:
             _adls_gen2_safe_upload(file_client, buf.getvalue(), True)
             logger.debug(f"Wrote partitioned XLSX: {file_path}")
 
+    SUPPORTED_AUDIO_EXTENSIONS = {'wav', 'mp3', 'flac', 'aac', 'ogg', 'm4a'}
+
+    @_protect_adls_method
+    def write_audio_files(self, dataframe: DataFrame, container: str, blob_path: str,
+                          mode: str = 'error', partition_columns: List[str] = None,
+                          options: Optional[Dict] = None) -> None:
+        """
+        Write audio files directly to ADLS as a binary passthrough.
+
+        Expected DataFrame schema: path (StringType), content (BinaryType).
+        Each row is written as an individual file, preserving the filename from
+        the path column. No audio processing library is required — files are
+        written as raw bytes.
+
+        Supported extensions: wav, mp3, flac, aac, ogg, m4a
+
+        Args:
+            dataframe: DataFrame with 'path' and 'content' columns
+            container: ADLS container name
+            blob_path: Target directory path for audio files
+            mode: Write mode ('overwrite', 'append', 'ignore', 'error')
+            partition_columns: Optional partition columns
+            options: Additional writing options
+        """
+        try:
+            # Validate schema — content column must exist and be BinaryType
+            schema_fields = {f.name: f.dataType for f in dataframe.schema.fields}
+            if 'content' not in schema_fields:
+                raise ValueError(
+                    "DataFrame must contain a 'content' column with BinaryType data. "
+                    f"Found columns: {list(schema_fields.keys())}"
+                )
+            from pyspark.sql.types import BinaryType as _BinaryType
+            if not isinstance(schema_fields['content'], _BinaryType):
+                raise ValueError(
+                    f"The 'content' column must be BinaryType, "
+                    f"got: {schema_fields['content'].simpleString()}"
+                )
+            if 'path' not in schema_fields:
+                raise ValueError(
+                    "DataFrame must contain a 'path' column with the target filename. "
+                    f"Found columns: {list(schema_fields.keys())}"
+                )
+
+            with self.__lock:
+                file_system_client = self.__adls_client.get_file_system_client(container)
+                safe_options = self._filter_sensitive_options(options)
+
+                with WriteTransactionContext(
+                    file_system_client, blob_path, mode, self.__adls_client.account_name
+                ) as tx:
+                    if tx.committed:
+                        return
+                    write_path = tx.get_temp_path()
+                    self._write_single_audio_files(
+                        dataframe, file_system_client, write_path, safe_options)
+
+                logger.info(f"Successfully wrote audio files to {blob_path} (mode: {mode})")
+
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to write audio files to {blob_path}: {str(e)}")
+            raise RuntimeError(f"Audio file writing failed: {str(e)}")
+
+    def _write_single_audio_files(self, dataframe: DataFrame,
+                                  file_system_client: FileSystemClient,
+                                  target_path: str, options: Dict) -> None:
+        """Write each row as an individual audio file, validating the extension."""
+        try:
+            pandas_df = dataframe.toPandas()
+
+            for idx, row in pandas_df.iterrows():
+                original_path = row['path']
+                filename = original_path.split('/')[-1] if '/' in original_path else original_path
+
+                if not filename or filename in ('/', '\\'):
+                    filename = f"audio_{idx}.wav"
+
+                # Validate extension
+                ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+                if ext not in self.SUPPORTED_AUDIO_EXTENSIONS:
+                    raise ValueError(
+                        f"Unsupported audio extension '.{ext}' in file '{filename}'. "
+                        f"Supported: {sorted(self.SUPPORTED_AUDIO_EXTENSIONS)}"
+                    )
+
+                target_file_path = f"{target_path}/{filename}"
+                file_client = file_system_client.get_file_client(target_file_path)
+                _adls_gen2_safe_upload(file_client, row['content'], True)
+
+                logger.debug(f"Wrote audio file: {target_file_path}")
+
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to write audio files: {str(e)}")
+            raise
+
     def validate_dataframe_for_format(self, dataframe: DataFrame, format_type: str) -> List[str]:
         """
         Validate DataFrame schema compatibility with target format.
@@ -1743,7 +1844,7 @@ class DirectADLSWriter:
 
     def get_supported_write_operations(self) -> List[str]:
         """Return the list of supported write format operations."""
-        return ['csv', 'json', 'yaml', 'xlsx', 'text', 'binaryfile', 'image', 'parquet', 'orc', 'avro', 'xml']
+        return ['csv', 'json', 'yaml', 'xlsx', 'text', 'binaryfile', 'image', 'audio', 'wav', 'mp3', 'parquet', 'orc', 'avro', 'xml']
 
     def get_supported_write_modes(self) -> List[str]:
         """Return the list of supported write modes."""

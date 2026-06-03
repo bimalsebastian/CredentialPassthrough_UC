@@ -9,6 +9,10 @@ Required dependency: PyYAML (available in standard Databricks Runtime)
 
 Required dependency: openpyxl (NOT included in Databricks Runtime by default —
     must be installed on the cluster via init script or %pip install openpyxl)
+
+Optional dependency: mutagen (only needed for audio_mode='metadata')
+    %pip install mutagen
+    Audio binary mode (default) requires no extra dependencies.
 """
 
 import io
@@ -759,6 +763,182 @@ class DirectADLSReader:
                 if row[i] is None and row[i - 1] is not None:
                     row[i] = row[i - 1]
         return rows
+
+    SUPPORTED_AUDIO_EXTENSIONS = {'wav', 'mp3', 'flac', 'aac', 'ogg', 'm4a'}
+
+    def read_audio_files(self, container: str, blob_path: str,
+                         options: Optional[Dict] = None) -> DataFrame:
+        """
+        Read audio files from ADLS with two modes controlled by the 'audio_mode' option.
+
+        Mode 1 — "binary" (default):
+            Returns a DataFrame with columns: path (StringType), content (BinaryType),
+            filename (StringType). No additional dependencies required.
+
+        Mode 2 — "metadata":
+            Uses mutagen to extract audio metadata. Returns a DataFrame with columns:
+            filename, format, duration_seconds, sample_rate, channels, bitrate,
+            file_size_bytes. Requires mutagen to be installed.
+
+        Supported extensions: wav, mp3, flac, aac, ogg, m4a
+
+        Args:
+            container: ADLS container name
+            blob_path: Path to file(s) - supports wildcards
+            options: Reading options. Supported keys:
+                     - audio_mode: 'binary' (default) or 'metadata'
+
+        Returns:
+            Spark DataFrame (schema depends on audio_mode)
+        """
+        opts = options or {}
+        audio_mode = opts.get('audio_mode', 'binary').lower()
+
+        if audio_mode == 'metadata':
+            return self._read_audio_metadata(container, blob_path, opts)
+        else:
+            return self._read_audio_binary(container, blob_path, opts)
+
+    def _read_audio_binary(self, container: str, blob_path: str,
+                           options: Dict) -> DataFrame:
+        """Read audio files as raw binary content — no extra dependencies."""
+        try:
+            file_system_client = self.adls_client.get_file_system_client(container)
+            file_paths = self._resolve_file_paths(file_system_client, blob_path)
+
+            if len(file_paths) > self.max_files_per_read:
+                logger.warning(f"Found {len(file_paths)} files, "
+                               f"limiting to {self.max_files_per_read}")
+                file_paths = file_paths[:self.max_files_per_read]
+
+            files_data = []
+            for file_path in file_paths:
+                try:
+                    # Validate audio extension
+                    filename = file_path.split('/')[-1]
+                    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+                    if ext not in self.SUPPORTED_AUDIO_EXTENSIONS:
+                        logger.warning(f"Skipping non-audio file: {file_path}")
+                        continue
+
+                    file_client = file_system_client.get_file_client(file_path)
+                    properties = file_client.get_file_properties()
+
+                    file_size_mb = properties.size / (1024 * 1024)
+                    if file_size_mb > self.max_file_size_mb:
+                        logger.warning(f"Skipping large file {file_path} "
+                                       f"({file_size_mb:.1f} MB)")
+                        continue
+
+                    content_bytes = file_client.download_file().readall()
+
+                    files_data.append({
+                        'path': (f"abfss://{container}@"
+                                 f"{self.adls_client.account_name}"
+                                 f".dfs.core.windows.net/{file_path}"),
+                        'content': bytearray(content_bytes),
+                        'filename': filename,
+                    })
+
+                except Exception as e:
+                    logger.warning(f"Failed to read audio file {file_path}: {e}")
+
+            if not files_data:
+                raise RuntimeError(f"No audio files could be read from {blob_path}")
+
+            schema = StructType([
+                StructField("path",     StringType(), False),
+                StructField("content",  BinaryType(), True),
+                StructField("filename", StringType(), False),
+            ])
+
+            return self.spark.createDataFrame(files_data, schema)
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to read audio files (binary) from {blob_path}: {e}")
+            raise RuntimeError(f"Audio file reading (binary) failed: {e}")
+
+    def _read_audio_metadata(self, container: str, blob_path: str,
+                             options: Dict) -> DataFrame:
+        """Read audio files and extract metadata using mutagen."""
+        try:
+            import mutagen
+        except ImportError:
+            raise RuntimeError(
+                "mutagen is required for audio metadata mode. "
+                "Install with: %pip install mutagen. "
+                "For raw file access use audio_mode='binary' (no extra dependencies)."
+            )
+
+        try:
+            file_system_client = self.adls_client.get_file_system_client(container)
+            file_paths = self._resolve_file_paths(file_system_client, blob_path)
+
+            if len(file_paths) > self.max_files_per_read:
+                logger.warning(f"Found {len(file_paths)} files, "
+                               f"limiting to {self.max_files_per_read}")
+                file_paths = file_paths[:self.max_files_per_read]
+
+            records = []
+            for file_path in file_paths:
+                try:
+                    filename = file_path.split('/')[-1]
+                    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+                    if ext not in self.SUPPORTED_AUDIO_EXTENSIONS:
+                        logger.warning(f"Skipping non-audio file: {file_path}")
+                        continue
+
+                    file_client = file_system_client.get_file_client(file_path)
+                    properties = file_client.get_file_properties()
+
+                    file_size_mb = properties.size / (1024 * 1024)
+                    if file_size_mb > self.max_file_size_mb:
+                        logger.warning(f"Skipping large file {file_path} "
+                                       f"({file_size_mb:.1f} MB)")
+                        continue
+
+                    content_bytes = file_client.download_file().readall()
+
+                    # mutagen.File can read from a file-like object
+                    audio_info = mutagen.File(io.BytesIO(content_bytes))
+
+                    duration = None
+                    sample_rate = None
+                    channels = None
+                    bitrate = None
+                    audio_format = ext.upper()
+
+                    if audio_info is not None and audio_info.info is not None:
+                        duration = getattr(audio_info.info, 'length', None)
+                        sample_rate = getattr(audio_info.info, 'sample_rate', None)
+                        channels = getattr(audio_info.info, 'channels', None)
+                        bitrate = getattr(audio_info.info, 'bitrate', None)
+
+                    records.append({
+                        'filename': filename,
+                        'format': audio_format,
+                        'duration_seconds': float(duration) if duration else None,
+                        'sample_rate': int(sample_rate) if sample_rate else None,
+                        'channels': int(channels) if channels else None,
+                        'bitrate': int(bitrate) if bitrate else None,
+                        'file_size_bytes': properties.size,
+                    })
+
+                except Exception as e:
+                    logger.warning(f"Failed to read audio metadata for {file_path}: {e}")
+
+            if not records:
+                raise RuntimeError(f"No audio metadata could be extracted from {blob_path}")
+
+            return self.spark.createDataFrame(pd.DataFrame(records))
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to read audio metadata from {blob_path}: {e}")
+            raise RuntimeError(f"Audio metadata reading failed: {e}")
 
     def read_binary_files(self, container: str, blob_path: str,
                         options: Optional[Dict] = None) -> DataFrame:

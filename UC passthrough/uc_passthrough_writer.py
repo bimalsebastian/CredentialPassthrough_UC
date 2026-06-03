@@ -54,7 +54,7 @@ class UCPassthroughFormatWriter:
     """
 
     # Formats routed directly to ADLS when path analysis says 'adls'
-    _ADLS_DIRECT_FORMATS = {'csv', 'json', 'yaml', 'yml', 'xlsx', 'text', 'binaryfile', 'image', 'parquet', 'orc', 'avro'}
+    _ADLS_DIRECT_FORMATS = {'csv', 'json', 'yaml', 'yml', 'xlsx', 'text', 'binaryfile', 'image', 'audio', 'wav', 'mp3', 'parquet', 'orc', 'avro'}
 
     # Formats that always go through UC regardless of path
     _UC_ONLY_FORMATS = {'delta', 'jdbc', 'table'}
@@ -274,6 +274,12 @@ class UCPassthroughFormatWriter:
             'yml':        lambda: writer.write_yaml_files(
                               self._df, container, blob_path, mode, partition_cols, opts),
             'xlsx':       lambda: writer.write_xlsx_files(
+                              self._df, container, blob_path, mode, partition_cols, opts),
+            'audio':      lambda: writer.write_audio_files(
+                              self._df, container, blob_path, mode, partition_cols, opts),
+            'wav':        lambda: writer.write_audio_files(
+                              self._df, container, blob_path, mode, partition_cols, opts),
+            'mp3':        lambda: writer.write_audio_files(
                               self._df, container, blob_path, mode, partition_cols, opts),
         }
 
