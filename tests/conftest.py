@@ -125,8 +125,9 @@ sys.modules.setdefault("pyarrow.orc", MagicMock())
 sys.modules.setdefault("chardet", MagicMock())
 sys.modules.setdefault("fastavro", MagicMock())
 
-# Add source path
-sys.path.insert(0, "/tmp/CredentialPassthrough_UC/UC passthrough")
+# Add source path — resolved relative to this file so it works in CI and locally
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "UC passthrough"))
 
 # Import the writer module and unwrap all protected methods on DirectADLSWriter
 # so tests can call them directly without frame-inspection blocking.
