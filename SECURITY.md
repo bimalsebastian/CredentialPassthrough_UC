@@ -24,7 +24,7 @@ The library's defence boundary is narrow and explicit: it is a **routing enforce
 | Format allowlist (write) | `SUPPORTED_WRITE_FORMATS` frozenset in `uc_passthrough_writer.py` | Same for write path; `delta` is excluded from direct ADLS writes (must go through UC governance via `saveAsTable`) |
 | Chunked stream non-logging | `DirectADLSReader` / `DirectADLSWriter` streaming paths | File content bytes are never passed to `logger.*` calls; only byte counts and path metadata are logged |
 | ADLS method caller-frame check | `_protect_adls_method` decorator in `direct_adls_writer.py` | Blocks external callers from invoking protected writer methods directly — only trusted package modules pass the frame-inspection check |
-| Exception message sanitisation | All `raise RuntimeError(...)` paths in auth and reader/writer | Error messages contain only exception type and safe path prefix. Full Azure SDK exception detail (which may include storage account URLs, container names, or request IDs) is captured at DEBUG log level only. Fixed in v1.2.0 — previously partially implemented. |
+| Exception message sanitisation | All `raise RuntimeError(...)` paths in auth and reader/writer | Error messages in both reader and writer contain only exception type and safe path prefix. Full Azure SDK exception detail captured at DEBUG log level only. Fully implemented in v1.2.1 — reader fixed in v1.2.0, writer fixed in v1.2.1. |
 
 ## Known limitations
 
@@ -35,6 +35,7 @@ The library's defence boundary is narrow and explicit: it is a **routing enforce
 - **No runtime integrity verification.** The library does not verify its own bytecode or module hash at load time. A sophisticated attacker could patch `sys.modules` entries before the library is imported.
 - **UC governance is authoritative.** This library routes traffic to UC — it does not replicate UC's permission model. If UC permissions are misconfigured, the library will faithfully send the request through and UC will grant it.
 - **Token lifetime.** Tokens cached by `TokenCache` remain valid for their Azure AD lifetime (typically 60–90 minutes). The library refreshes within 5 minutes of expiry but cannot revoke tokens mid-session if user permissions change server-side.
+- **No structured audit trail for SIEM integration.** The library logs routing decisions and authentication events via Python's standard logging module. There is no structured audit output (JSON lines with timestamp, user identity, operation type, path prefix, and access method) that a security team could ingest into Splunk, Microsoft Sentinel, or Azure Monitor. For regulated environments requiring operation-level audit trails, this is a gap. Structured audit logging is planned as a v1.3 feature — in the interim, cluster-level ADLS diagnostic logging in Azure Monitor provides the authoritative audit record.
 
 ## Test coverage
 
@@ -69,6 +70,7 @@ The library uses the following third-party packages beyond the Databricks Runtim
 
 | Version | Change |
 |---------|--------|
-| v1.2.0 | Corrected exception sanitisation coverage — raw Azure SDK exceptions now captured at DEBUG only. Updated known limitations: name-mangling triviality, `__main__` frame-check no-op in notebooks, hash-pinning status changed from recommendation to documented gap. |
+| v1.2.1 | Writer exception sanitisation completed (missed in v1.2.0). Audit trail gap added to known limitations. |
+| v1.2.0 | Reader exception sanitisation only — writer fix missed, corrected in v1.2.1. Updated known limitations: name-mangling triviality, `__main__` frame-check no-op in notebooks, hash-pinning status changed from recommendation to documented gap. |
 | v1.1.0 | Initial security hardening release — __slots__, path traversal validation, format allowlists, repr sanitisation, options scrubbing. |
 | v1.0.0 | No formal security controls documented. |
